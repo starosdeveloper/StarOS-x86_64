@@ -1,0 +1,73 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/acpi",
+    "crates/bootinfo",
+    "crates/arch-x86_64",
+    "crates/kernel",
+]
+
+# ---------------------------------------------------------------------------
+# Shared metadata, mirroring `../kernel-new` so the two trees version together.
+# ---------------------------------------------------------------------------
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["STAR OS Team"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/staros/kernel"
+rust-version = "1.90"
+
+# ---------------------------------------------------------------------------
+# Dependencies.
+#
+# The portable half of the kernel is NOT copied here — it is the *same code*,
+# addressed by path into `../kernel-new/crates`. That is the whole point of this
+# tree: a second architecture is the only honest test of whether the HAL boundary
+# is real, and a fork would fail that test on day one by letting the two drift.
+#
+# The split is exactly the one `../kernel-new/docs/ARCHITECTURE.md` describes:
+#
+#   shared   — abi, hal, mm, ipc, cpio, framebuffer, drivers
+#              (no MMIO, no architecture, host-testable)
+#   here     — acpi, bootinfo, arch-x86_64, kernel
+#              (x86 tables, the UEFI hand-off contract, the port itself)
+#
+# `iommu` is deliberately *not* shared: it is the ARM SMMUv3 bit-layout, and the
+# PC equivalent (Intel VT-d / AMD-Vi) is a different set of structures that will
+# get its own crate here when phase 5 arrives. Sharing the name would have been
+# tidier than sharing the meaning.
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+staros-abi = { path = "../kernel-new/crates/abi" }
+staros-hal = { path = "../kernel-new/crates/hal" }
+staros-mm = { path = "../kernel-new/crates/mm" }
+staros-ipc = { path = "../kernel-new/crates/ipc" }
+staros-cpio = { path = "../kernel-new/crates/cpio" }
+staros-framebuffer = { path = "../kernel-new/crates/framebuffer" }
+staros-drivers = { path = "../kernel-new/crates/drivers" }
+
+staros-acpi = { path = "crates/acpi" }
+staros-bootinfo = { path = "crates/bootinfo" }
+staros-arch-x86-64 = { path = "crates/arch-x86_64" }
+
+# Same lint discipline as the aarch64 tree: a second architecture is not an
+# excuse for a second standard.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+missing_docs = "warn"
+unused_must_use = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+missing_safety_doc = "warn"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "z"
+codegen-units = 1
+strip = true

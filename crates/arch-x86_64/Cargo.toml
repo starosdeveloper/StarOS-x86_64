@@ -1,0 +1,19 @@
+[package]
+name = "staros-arch-x86-64"
+description = "x86_64 architecture backend: boot hand-off, CPU tables, APIC, paging"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+staros-abi.workspace = true
+staros-hal.workspace = true
+staros-mm.workspace = true
+staros-acpi.workspace = true
+staros-bootinfo.workspace = true

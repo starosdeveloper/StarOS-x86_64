@@ -1,0 +1,6 @@
+/target
+*.img
+*.efi
+*.bin
+
+# Cargo.lock IS committed: a kernel wants reproducible dependency builds.

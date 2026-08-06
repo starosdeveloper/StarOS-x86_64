@@ -1,0 +1,9 @@
+# Kernel development needs the unstable `build-std` feature and a bare-metal
+# `no_std` core, so we pin nightly and pull in the components required to build
+# core/alloc from source and to run objcopy/strip via llvm-tools.
+#
+# `rustup` reads this file automatically: the first `cargo` invocation in this
+# workspace installs the toolchain and components below if they are missing.
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "llvm-tools", "rustfmt", "clippy"]

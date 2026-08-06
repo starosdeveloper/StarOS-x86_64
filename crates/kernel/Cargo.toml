@@ -1,0 +1,28 @@
+[package]
+name = "kernel"
+description = "STAR OS microkernel — the x86_64 PC binary"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+
+[dependencies]
+staros-abi.workspace = true
+staros-hal.workspace = true
+staros-mm.workspace = true
+staros-ipc.workspace = true
+staros-cpio.workspace = true
+staros-framebuffer.workspace = true
+staros-drivers.workspace = true
+staros-acpi.workspace = true
+staros-bootinfo.workspace = true
+staros-arch-x86-64.workspace = true

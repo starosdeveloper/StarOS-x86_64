@@ -1,0 +1,37 @@
+# Default build target: freestanding 64-bit x86, no OS underneath.
+#
+# `x86_64-unknown-none` (not `-unknown-uefi`): the kernel proper is a plain ELF
+# the loader hands control to, exactly as on aarch64. The UEFI half — the piece
+# that *is* a PE/COFF application, calls boot services and exits them — is a
+# separate, small binary built for `x86_64-unknown-uefi`; see docs/SPEC.md §2.
+# Keeping the kernel out of PE/COFF means it is not built against a firmware ABI
+# it stops being able to use the moment it calls ExitBootServices.
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+# Only the linker script is set here. Three things this kernel depends on come
+# from the built-in target spec and are deliberately NOT repeated as flags,
+# because a repeated flag is a second place to keep in sync — verify with
+# `rustc --print target-spec-json -Z unstable-options --target x86_64-unknown-none`:
+#
+#   "features": "...-sse,-sse2,...,+soft-float"  — SSE/MMX state is not saved
+#       across our context switches; LLVM emitting SSE for a memcpy would corrupt
+#       user state silently.
+#   "code-model": "kernel"  — the image lives in the top 2 GiB, so every symbol
+#       is RIP-reachable with a 32-bit displacement: no GOT, no PLT, no boot-time
+#       relocation.
+#   "disable-redzone": true  — the red zone is unusable when an interrupt can
+#       land on any instruction; the CPU pushes its frame over those 128 bytes.
+rustflags = ["-C", "link-arg=-Tcrates/arch-x86_64/linker.ld"]
+
+# Convenience aliases, matching `../kernel-new`'s so muscle memory carries over.
+#   * kernel builds carry `build-std` (core/alloc from source for the memory
+#     intrinsics); host test builds must not, or the precompiled `std`'s `core`
+#     collides with the rebuilt one.
+[alias]
+kbuild = "build -p kernel -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem"
+kclippy = "clippy -p kernel -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem"
+# The pure-logic tests, on the host. Shared crates are tested in ../kernel-new;
+# these are the ones this tree owns.
+ktest-host = "test -p staros-acpi -p staros-bootinfo --target x86_64-unknown-linux-gnu"
