@@ -123,15 +123,36 @@ pub fn convert(
     Ok(n)
 }
 
-/// The highest physical address any descriptor reaches, rounded up to `align`.
+/// The highest physical address reached by anything that is **memory**, rounded
+/// up to `align`.
 ///
-/// Used to size the identity and linear maps. Every entry counts, not just the
-/// usable ones: MMIO apertures reported by firmware must be reachable through the
-/// linear map, or the kernel cannot touch a device it discovers through ACPI.
+/// Used to size the identity and linear maps, and the exclusion of device
+/// apertures is the point. A PCIe 64-bit window sits wherever firmware felt like
+/// putting it: QEMU's q35 reports **12 GiB at 1012 GiB**, which stretched the map
+/// to 1024 GiB the first time this ran. Counting it does not make the window
+/// usable; it makes the loader build a terabyte of mappings to reach a few MiB of
+/// registers. With 2 MiB pages that is 4 MiB of page tables for one aperture, and
+/// on a machine with a 64 TiB window it is a failed allocation and no boot.
+///
+/// That window is reported as `EfiReservedMemoryType`, not as MMIO, which is why
+/// the filter cannot just be "not MMIO". Reserved is excluded on its own terms:
+/// the specification's word for it is memory the OS must not use, and a range the
+/// OS must not use has no claim on the linear map. Excluding a type only ever
+/// matters at the very top — a reserved hole *inside* RAM is still covered, by
+/// whatever real memory lies above it.
+///
+/// The fixed apertures the kernel actually needs early — local APIC, I/O APIC,
+/// HPET, ECAM — all live below 4 GiB, which the caller covers with a floor.
+/// Anything higher is a device the kernel will map deliberately, once ACPI has
+/// named it and it owns its own page tables.
 ///
 /// # Errors
 /// [`ConvertError::BadDescriptorSize`] for an impossible stride.
-pub fn highest_address(map: &[u8], descriptor_size: usize, align: u64) -> Result<u64, ConvertError> {
+pub fn highest_ram_address(
+    map: &[u8],
+    descriptor_size: usize,
+    align: u64,
+) -> Result<u64, ConvertError> {
     if descriptor_size < core::mem::size_of::<MemoryDescriptor>() {
         return Err(ConvertError::BadDescriptorSize);
     }
@@ -140,6 +161,16 @@ pub fn highest_address(map: &[u8], descriptor_size: usize, align: u64) -> Result
     while offset + descriptor_size <= map.len() {
         let raw = &map[offset..offset + descriptor_size];
         offset += descriptor_size;
+        let ty = u32::from_le_bytes(raw[0..4].try_into().expect("4 bytes"));
+        if matches!(
+            ty,
+            memory_type::RESERVED
+                | memory_type::MMIO
+                | memory_type::MMIO_PORT
+                | memory_type::PAL_CODE
+        ) {
+            continue;
+        }
         let phys = u64::from_le_bytes(raw[8..16].try_into().expect("8 bytes"));
         let pages = u64::from_le_bytes(raw[24..32].try_into().expect("8 bytes"));
         hi = hi.max(phys.saturating_add(pages.saturating_mul(EFI_PAGE_SIZE)));
@@ -304,7 +335,7 @@ mod tests {
     fn an_impossible_descriptor_size_is_rejected_before_any_read() {
         let map = vec![0u8; 128];
         assert_eq!(convert(&map, 8, &mut []), Err(ConvertError::BadDescriptorSize));
-        assert_eq!(highest_address(&map, 8, 4096), Err(ConvertError::BadDescriptorSize));
+        assert_eq!(highest_ram_address(&map, 8, 4096), Err(ConvertError::BadDescriptorSize));
     }
 
     #[test]
@@ -319,28 +350,49 @@ mod tests {
     fn an_empty_map_converts_to_nothing_rather_than_failing() {
         let mut out = [MemoryRegion::new(0, 0, MemoryKind::Reserved); 4];
         assert_eq!(convert(&[], NATIVE, &mut out).unwrap(), 0);
-        assert_eq!(highest_address(&[], NATIVE, 4096).unwrap(), 0);
+        assert_eq!(highest_ram_address(&[], NATIVE, 4096).unwrap(), 0);
     }
 
     #[test]
-    fn highest_address_covers_mmio_above_ram_and_rounds_up() {
+    fn a_high_device_aperture_does_not_stretch_the_map() {
+        const GIB: u64 = 1 << 30;
         let map = map_of(
             &[
-                (memory_type::CONVENTIONAL, 0x0, 0x8_0000),   // 2 GiB of RAM
-                (0xB, 0xFEE0_0000, 1),                        // local APIC MMIO
+                (memory_type::CONVENTIONAL, 0x0, 0x8_0000),          // 2 GiB of RAM
+                (memory_type::MMIO, 0x100_0000_0000, 0x1000),        // an MMIO window
+                (memory_type::MMIO_PORT, 0x200_0000_0000, 0x10),
+                // Exactly what q35 reports, and the entry that actually caused
+                // the 1024 GiB map: a 12 GiB *reserved* range at 1012 GiB. The
+                // filter has to catch this one, not just the MMIO-typed ones.
+                (memory_type::RESERVED, 0xFD_0000_0000, 0x30_0000),
+                (memory_type::PAL_CODE, 0x300_0000_0000, 1),
             ],
             NATIVE,
         );
+        assert_eq!(highest_ram_address(&map, NATIVE, GIB).unwrap(), 2 * GIB);
+    }
+
+    #[test]
+    fn reserved_and_acpi_ranges_still_count_as_memory() {
         const GIB: u64 = 1 << 30;
-        // Rounded to the next GiB boundary above 0xFEE01000.
-        assert_eq!(highest_address(&map, NATIVE, GIB).unwrap(), 4 * GIB);
+        // Firmware puts its own tables and NVS at the top of RAM. Those must be
+        // inside the linear map: the kernel reads the ACPI tables through it.
+        let map = map_of(
+            &[
+                (memory_type::CONVENTIONAL, 0x0, 0x8_0000),
+                (memory_type::ACPI_NVS, 0x8000_0000, 0x10),
+                (memory_type::BOOT_SERVICES_DATA, 0x8001_0000, 0x10),
+            ],
+            NATIVE,
+        );
+        assert_eq!(highest_ram_address(&map, NATIVE, GIB).unwrap(), 3 * GIB);
     }
 
     #[test]
     fn a_descriptor_claiming_the_end_of_the_address_space_saturates() {
         let map = map_of(&[(memory_type::CONVENTIONAL, u64::MAX - 4095, u64::MAX)], NATIVE);
         // Must not wrap to a small number, which would under-size the linear map.
-        assert_eq!(highest_address(&map, NATIVE, 4096).unwrap(), u64::MAX);
+        assert_eq!(highest_ram_address(&map, NATIVE, 4096).unwrap(), u64::MAX);
         let mut out = [MemoryRegion::new(0, 0, MemoryKind::Reserved); 4];
         assert_eq!(convert(&map, NATIVE, &mut out).unwrap(), 1);
         assert_eq!(out[0].end(), u64::MAX);

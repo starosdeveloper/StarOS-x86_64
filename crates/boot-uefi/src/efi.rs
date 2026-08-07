@@ -140,6 +140,16 @@ pub mod memory_type {
     /// `EfiPersistentMemory` — byte-addressable non-volatile memory. Present, but
     /// not general-purpose RAM.
     pub const PERSISTENT: u32 = 14;
+    /// `EfiReservedMemoryType` — memory the OS must not use. Firmware also parks
+    /// device windows here: QEMU's q35 reports its 64-bit PCI hole as 12 GiB of
+    /// this type at 1012 GiB.
+    pub const RESERVED: u32 = 0;
+    /// `EfiMemoryMappedIO` — a device aperture, not memory.
+    pub const MMIO: u32 = 11;
+    /// `EfiMemoryMappedIOPortSpace`.
+    pub const MMIO_PORT: u32 = 12;
+    /// `EfiPalCode` — Itanium firmware code. Never memory on x86.
+    pub const PAL_CODE: u32 = 13;
 }
 
 /// `EFI_ALLOCATE_TYPE::AllocateAnyPages`.

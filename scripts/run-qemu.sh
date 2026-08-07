@@ -89,7 +89,11 @@ chmod u+w "$RUNVARS"
 
 ARGS=(
     -machine q35
-    -cpu qemu64
+    # `max`, not the `qemu64` default: that model does not advertise PDPE1GB, so
+    # the loader falls back to 2 MiB pages and builds 512x the page tables for
+    # the same mapping. Real hardware has 1 GiB pages; the emulator should not
+    # be the only place the other branch is ever exercised.
+    -cpu max
     -smp "$CPUS"
     -m "$MEMORY"
     -drive "if=pflash,format=raw,unit=0,readonly=on,file=$CODE"

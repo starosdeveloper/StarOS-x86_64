@@ -28,6 +28,10 @@ const GIB: u64 = 1 << 30;
 /// ECAM window all sit just below 4 GiB on every PC, and the kernel must be able
 /// to reach them through the linear map after ACPI names them — on a machine with
 /// 2 GiB of RAM, sizing the map by RAM alone would leave every one unmapped.
+///
+/// This floor is also what makes it safe for [`memmap::highest_ram_address`] to
+/// ignore device apertures: the ones needed early are all under it, and the ones
+/// above it are for the kernel to map deliberately once it owns its tables.
 const MIN_MAPPED: u64 = 4 * GIB;
 
 /// Extra descriptors to budget for beyond what the first `GetMemoryMap` reports.
@@ -173,7 +177,7 @@ pub unsafe fn run(
         check("GetMemoryMap (probe)", status)?;
         (core::slice::from_raw_parts(probe_buf as *const u8, size), desc_size)
     };
-    let mapped = memmap::highest_address(probe.0, probe.1, GIB)
+    let mapped = memmap::highest_ram_address(probe.0, probe.1, GIB)
         .map_err(|_| Error::own("firmware reported an impossible descriptor size"))?
         .max(MIN_MAPPED);
 

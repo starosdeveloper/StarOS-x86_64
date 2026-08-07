@@ -1,15 +1,21 @@
-//! Loader output: the firmware console and COM1, in parallel.
+//! Loader output: the firmware console while it exists, COM1 after.
 //!
-//! Both, because each covers the other's blind spot. The firmware console is the
-//! only thing visible on a machine with no serial port — which is most laptops —
-//! but it disappears at `ExitBootServices`, and it cannot be captured into a
-//! file. COM1 survives the transition, is what QEMU logs, and is the channel the
-//! kernel itself comes up on, so the loader's last line and the kernel's first
-//! land in the same stream where their order is evidence.
+//! Never both at once, and that is the whole subtlety. `ConOut` is not a screen —
+//! it is whatever the firmware has bound to it, and on OVMF (and on most machines
+//! with the serial console enabled) that **includes COM1**. Driving the UART
+//! directly at the same time puts every character on the wire twice, interleaved
+//! at the flush boundaries, which reads as corruption rather than as duplication:
 //!
-//! Writing to a dead console must not fault: after `ExitBootServices` the
-//! firmware pointer is cleared with [`Console::firmware_is_gone`], and everything
-//! afterwards goes to serial alone.
+//! ```text
+//! acpi: rsdp at acpi: rsdp at 0x0x1f77e0141f77e014
+//! ```
+//!
+//! So the firmware console wins while it is alive: it reaches the screen on a
+//! machine with no serial port, and it reaches serial on a machine that has one
+//! configured. COM1 is driven directly only when there is no `ConOut` at all, and
+//! from [`Console::firmware_is_gone`] onwards — where it is the only channel left
+//! and is also the one the kernel comes up on, so the loader's last line and the
+//! kernel's first land in the same stream in the order they happened.
 
 use core::fmt::{self, Write};
 
@@ -28,7 +34,11 @@ pub struct Console {
     /// `ConOut`, or null once boot services are gone.
     out: *mut SimpleTextOutput,
     uart: Uart16550,
+    /// Whether COM1 answered the loopback probe at all.
     have_serial: bool,
+    /// Whether to drive COM1 directly. False while `ConOut` is alive, because
+    /// the firmware is very likely writing there already.
+    to_serial: bool,
 }
 
 impl Console {
@@ -41,7 +51,9 @@ impl Console {
         // SAFETY: the loader is the only thing driving COM1 at this point;
         // firmware may have configured it, and reconfiguring is harmless.
         let have_serial = unsafe { uart.init() };
-        Self { out, uart, have_serial }
+        // Only take the UART if there is no firmware console to take it for us.
+        let to_serial = have_serial && out.is_null();
+        Self { out, uart, have_serial, to_serial }
     }
 
     /// Forget the firmware console. Called immediately after `ExitBootServices`,
@@ -49,6 +61,9 @@ impl Console {
     /// has just been invalidated.
     pub fn firmware_is_gone(&mut self) {
         self.out = core::ptr::null_mut();
+        // Nothing is mirroring to the wire any more, so this is now the only
+        // channel — and the one the kernel is about to continue on.
+        self.to_serial = self.have_serial;
     }
 
     /// Whether a serial port answered the loopback probe.
@@ -76,7 +91,7 @@ impl Console {
     /// Emit one character to serial immediately and to the firmware buffer,
     /// flushing that buffer when it fills.
     fn emit(&mut self, c: char, buf: &mut [u16; UCS2_CHUNK + 1], len: &mut usize) {
-        if self.have_serial {
+        if self.to_serial {
             let mut utf8 = [0u8; 4];
             for b in c.encode_utf8(&mut utf8).as_bytes() {
                 self.uart.write_byte(*b);

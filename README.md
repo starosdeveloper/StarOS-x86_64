@@ -30,10 +30,11 @@ cargo kbuild        # kernel ELF   -> x86_64-unknown-none
 cargo kloader       # loader EFI   -> x86_64-unknown-uefi
 cargo kclippy       # clippy, kernel
 cargo kloader-clippy
-cargo ktest-host    # the crates this tree owns (68 tests)
+cargo ktest-host    # the crates this tree owns (69 tests)
 
-./scripts/mkesp.sh      # build both halves, stage an ESP layout
-./scripts/run-qemu.sh   # boot it: OVMF -> BOOTX64.EFI -> kernel
+./scripts/mkesp.sh       # build both halves, stage an ESP layout
+./scripts/run-qemu.sh    # boot it: OVMF -> BOOTX64.EFI -> kernel
+./scripts/smoke-test.sh  # boot it and assert on the output (30 assertions)
 ```
 
 Shared crates are tested in `../kernel-new` (`cargo ktest-host` there), so their
@@ -44,19 +45,33 @@ partition; `run-qemu.sh --debug` starts stopped with a gdb stub on `:1234`.
 
 ## Status
 
-**Phase 1.1 written, not yet verified on live firmware.** The loader collects the
-RSDP, the GOP framebuffer, the kernel and an optional initramfs off the ESP it
-was itself loaded from, places the `PT_LOAD` segments with their own rights
-(W^X), builds identity, linear and kernel mappings, takes the memory map last,
-leaves boot services with the retry the specification requires, and jumps to
-`_start` with `BootInfo` in `RDI`. The kernel takes its own stack, validates the
-hand-off and reports it.
+**Phase 1.1 complete, verified on live firmware.** OVMF finds
+`EFI/BOOT/BOOTX64.EFI`; the loader collects the RSDP, the GOP framebuffer, the
+kernel and an optional initramfs off the ESP it was itself loaded from, places
+the `PT_LOAD` segments with their own rights (W^X), builds identity, linear and
+kernel mappings, takes the memory map last, leaves boot services with the retry
+the specification requires, and jumps to `_start` with `BootInfo` in `RDI`. The
+kernel takes its own stack, validates the hand-off, and reports what it got.
 
-What has *not* happened is a boot: this machine has neither `qemu-system-x86_64`
-nor OVMF, so no firmware has ever run this loader. 68 host tests pass, both
-targets build, clippy is clean on both — and none of that is the same as a
-character on a screen. The two commands that would settle it are in
-[`docs/ROADMAP.md`](docs/ROADMAP.md) §1.1.
+```
+STAR OS loader v0.1.0 (x86_64 UEFI)
+acpi: rsdp at 0x1fb7e014
+gop: 1280x800 stride 5120 at 0x80000000
+esp: kernel 2769 KiB at 0x1db0d000
+kernel: 152 KiB placed at 0x1dae7000, mapped at 0xffffffff80000000, entry 0xffffffff80000000
+paging: 4 GiB identity + linear at 0xffff800000000000 (1 GiB pages), kernel W^X
+handoff: 30 regions, entry 0xffffffff80000000, boot info at 0x1de00000
+
+STAR OS microkernel (x86_64) v0.1.0
+boot info accepted: 30 memory regions, rsdp 0x1fb7e014, kernel 0x1dae7000+0x26000
+framebuffer: 1280x800 stride 5120 at 0x80000000 (4000 KiB)
+phase 1.1 complete: loaded by firmware, own stack, hand-off verified. Halting.
+```
+
+`smoke-test.sh` also breaks the input on purpose — the aarch64 kernel on the
+ESP, a truncated image, no image at all — and checks each is refused by name and
+halts rather than falling through to the next boot option. A loader that has only
+ever seen a good kernel is a loader whose error paths have never run.
 
 [`docs/SPEC.md`](docs/SPEC.md) holds the contracts: boot hand-off, memory layout,
 interrupt model, syscall ABI, and every place x86 differs from aarch64 along with
