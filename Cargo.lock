@@ -50,6 +50,9 @@ dependencies = [
 [[package]]
 name = "staros-bootinfo"
 version = "0.1.0"
+dependencies = [
+ "staros-framebuffer",
+]
 
 [[package]]
 name = "staros-cpio"

@@ -18,6 +18,10 @@ CPUS="1"
 EXTRA=()
 DEBUG=0
 HEADLESS=0
+SHOT=""
+SHOT_DELAY="${SHOT_DELAY:-12}"
+MON=""
+
 
 usage() {
     cat <<'EOF'
@@ -28,6 +32,11 @@ usage: run-qemu.sh [--memory 512M] [--cpus N] [--debug] [-- <extra qemu args>]
   --debug         start stopped with a gdb stub on :1234, and log interrupts
                   attach with:  gdb target/x86_64-unknown-none/debug/kernel
                                 (gdb) target remote :1234
+  --screenshot F  after ${SHOT_DELAY}s (SHOT_DELAY=n to change), dump the emulated
+                  display to F as a PPM through the QEMU monitor, and imply
+                  --headless. The only way to check that anything was actually
+                  *drawn* — a serial log cannot tell a blank screen from a full
+                  one.
   --headless      no QEMU window; serial only. The framebuffer still exists —
                   firmware sets up the emulated VGA either way — so GOP is
                   reported to the loader exactly as it would be with a display.
@@ -40,6 +49,7 @@ while [ $# -gt 0 ]; do
         --cpus) CPUS="${2:?--cpus needs a number}"; shift 2 ;;
         --debug) DEBUG=1; shift ;;
         --headless) HEADLESS=1; shift ;;
+        --screenshot) SHOT="${2:?--screenshot needs a path}"; HEADLESS=1; shift 2 ;;
         --) shift; EXTRA=("$@"); break ;;
         -h|--help) usage; exit 0 ;;
         *) echo "run-qemu.sh: unknown argument '$1'" >&2; usage >&2; exit 2 ;;
@@ -109,6 +119,37 @@ ARGS=(
     -d guest_errors
 )
 [ "$HEADLESS" = "1" ] && ARGS+=(-display none)
+if [ -n "$SHOT" ]; then
+    MON="$(mktemp -u -t staros-mon.XXXXXX)"
+    ARGS+=(-monitor "unix:$MON,server,nowait")
+    # Detached, because QEMU never returns on its own: the kernel halts. The
+    # delay has to outlast firmware plus boot, and 12s is generous for TCG.
+    (
+        sleep "$SHOT_DELAY"
+        python3 - "$MON" "$(readlink -f "$SHOT")" <<'PYEOF'
+import socket, sys, time
+sock, out = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+for _ in range(50):
+    try:
+        s.connect(sock)
+        break
+    except OSError:
+        time.sleep(0.2)
+else:
+    sys.exit("screenshot: could not reach the QEMU monitor")
+s.settimeout(5)
+try:
+    s.recv(4096)              # the monitor banner
+except OSError:
+    pass
+s.sendall(f"screendump {out}\n".encode())
+time.sleep(1.5)               # let the dump finish before the socket closes
+s.close()
+PYEOF
+        rm -f "$MON"
+    ) &
+fi
 # `-d int` traces every interrupt and exception. Far too loud for a normal run,
 # and exactly what is wanted when the question is "which fault killed it".
 [ "$DEBUG" = "1" ] && ARGS+=(-s -S -d guest_errors,int)

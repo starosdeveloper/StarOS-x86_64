@@ -45,9 +45,30 @@ forbid() {
 
 boot() {
     local log="$1"
+    shift
     # The kernel halts rather than exiting, so QEMU never returns on its own;
     # the timeout *is* the end of the run, not a failure.
-    timeout "$TIMEOUT" ./scripts/run-qemu.sh --headless > "$log" 2>&1 || true
+    timeout "$TIMEOUT" ./scripts/run-qemu.sh --headless "$@" > "$log" 2>&1 || true
+}
+
+# Assert on the captured screen. Delegated to a real file rather than inlined:
+# the check is a dozen lines of byte comparison, and a shell here-doc is a bad
+# place to keep anything containing backslash escapes.
+check_screen() {
+    local ppm="$1"
+    if [ ! -s "$ppm" ]; then
+        FAIL=$((FAIL + 1))
+        echo "  NO SCREENSHOT: the QEMU monitor produced nothing" >&2
+        return
+    fi
+    local out
+    if out=$(python3 ./scripts/check-screen.py "$ppm" 2>&1); then
+        PASS=$((PASS + 1))
+        echo "  screen: $out"
+    else
+        FAIL=$((FAIL + 1))
+        echo "  SCREEN CHECK FAILED: $out" >&2
+    fi
 }
 
 echo "==> staging"
@@ -57,7 +78,7 @@ cp target/esp/staros/kernel "$GOOD"
 
 # --------------------------------------------------------------------------
 echo "==> [good] firmware -> loader -> kernel"
-boot "$LOG_DIR/good.log"
+boot "$LOG_DIR/good.log" --screenshot "$LOG_DIR/screen.ppm"
 L="$LOG_DIR/good.log"
 
 expect "$L" "loader announces itself"        'STAR OS loader v[0-9]'
@@ -78,7 +99,12 @@ expect "$L" "hand-off built"                 'handoff: [0-9]+ regions'
 expect "$L" "kernel reached its own entry"   'STAR OS microkernel \(x86_64\)'
 expect "$L" "hand-off validated by the kernel" 'boot info accepted: [0-9]+ memory regions'
 expect "$L" "kernel sees the framebuffer"    'framebuffer: [0-9]+x[0-9]+ stride'
-expect "$L" "boot reached the end of phase 1.1" 'phase 1.1 complete'
+expect "$L" "screen attached, readback verified" 'console: mirroring to the screen \(readback self-test passed\)'
+forbid "$L" "screen described but unusable"  'console: screen unusable'
+expect "$L" "boot reached the end of phase 1.2" 'phase 1.2 complete'
+
+# What a serial log cannot answer: was anything drawn, and in the right colours.
+check_screen "$LOG_DIR/screen.ppm"
 
 forbid "$L" "loader failure"                 'BOOT FAILED'
 forbid "$L" "kernel panic"                   'KERNEL PANIC'

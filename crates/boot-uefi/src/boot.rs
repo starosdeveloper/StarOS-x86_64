@@ -192,6 +192,25 @@ pub unsafe fn run(
         tables.map(bs, 0, 0, mapped, Rights { write: true, exec: true })?;
         tables.map(bs, PHYS_MAP_BASE, 0, mapped, Rights::RW)?;
     }
+    // The framebuffer is normally an aperture below 4 GiB and already inside the
+    // maps above. Normally is not always: it is reported through GOP rather than
+    // through the memory map, so nothing above ties it to RAM's extent, and a
+    // machine that parks it higher would hand the kernel a console it cannot
+    // touch. Map it where it is not already covered.
+    let mut extra_fb = 0u64;
+    if framebuffer.is_sane() {
+        let base = framebuffer.phys & !(PAGE_SIZE - 1);
+        let end = (framebuffer.phys + framebuffer.bytes()).next_multiple_of(PAGE_SIZE);
+        if base >= mapped {
+            extra_fb = end - base;
+            // SAFETY: `bs` is live; the tree is not in CR3 yet.
+            unsafe {
+                tables.map(bs, base, base, extra_fb, Rights { write: true, exec: false })?;
+                tables.map(bs, PHYS_MAP_BASE + base, base, extra_fb, Rights::RW)?;
+            }
+        }
+    }
+
     let _ = writeln!(
         console,
         "paging: {} GiB identity + linear at {:#x} ({} pages), kernel W^X",
@@ -199,6 +218,13 @@ pub unsafe fn run(
         PHYS_MAP_BASE,
         if tables.uses_gib_pages() { "1 GiB" } else { "2 MiB" },
     );
+    if extra_fb != 0 {
+        let _ = writeln!(
+            console,
+            "paging: framebuffer sits above RAM - mapped {} KiB separately",
+            extra_fb / 1024
+        );
+    }
 
     // --- 6. Buffers for the hand-off, before the point of no allocation ---
     // SAFETY: `bs` is live.

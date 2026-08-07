@@ -12,3 +12,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+# The framebuffer the loader describes has to be *drawn on* by the kernel, and
+# the two crates name the same byte orders differently — see PixelFormat's
+# conversion, which exists so that inversion is written down once and tested.
+staros-framebuffer.workspace = true

@@ -13,7 +13,7 @@ the two drift.
 | Crate | Role |
 |-------|------|
 | `crates/acpi` | ACPI tables — the PC's device tree. RSDP, XSDT/RSDT, MADT, MCFG, HPET. No MMIO, no AML |
-| `crates/bootinfo` | The loader → kernel hand-off contract: memory map, framebuffer, RSDP, initramfs |
+| `crates/bootinfo` | The loader → kernel hand-off contract: memory map, framebuffer, RSDP, initramfs, and the address-space layout both binaries agree on |
 | `crates/elf64` | ELF64 program headers — how the loader reads a kernel image |
 | `crates/boot-uefi` | The UEFI loader: firmware bindings, ESP access, page tables, `ExitBootServices` |
 | `crates/arch-x86_64` | I/O ports, 16550 UART, CPU control. GDT/IDT, paging, APIC and SMP are scheduled, not stubbed |
@@ -30,11 +30,11 @@ cargo kbuild        # kernel ELF   -> x86_64-unknown-none
 cargo kloader       # loader EFI   -> x86_64-unknown-uefi
 cargo kclippy       # clippy, kernel
 cargo kloader-clippy
-cargo ktest-host    # the crates this tree owns (69 tests)
+cargo ktest-host    # the crates this tree owns (74 tests)
 
 ./scripts/mkesp.sh       # build both halves, stage an ESP layout
 ./scripts/run-qemu.sh    # boot it: OVMF -> BOOTX64.EFI -> kernel
-./scripts/smoke-test.sh  # boot it and assert on the output (30 assertions)
+./scripts/smoke-test.sh  # boot it and assert on the output (33 assertions)
 ```
 
 Shared crates are tested in `../kernel-new` (`cargo ktest-host` there), so their
@@ -45,13 +45,15 @@ partition; `run-qemu.sh --debug` starts stopped with a gdb stub on `:1234`.
 
 ## Status
 
-**Phase 1.1 complete, verified on live firmware.** OVMF finds
+**Phase 1.2 complete, verified on live firmware.** OVMF finds
 `EFI/BOOT/BOOTX64.EFI`; the loader collects the RSDP, the GOP framebuffer, the
 kernel and an optional initramfs off the ESP it was itself loaded from, places
 the `PT_LOAD` segments with their own rights (W^X), builds identity, linear and
 kernel mappings, takes the memory map last, leaves boot services with the retry
 the specification requires, and jumps to `_start` with `BootInfo` in `RDI`. The
-kernel takes its own stack, validates the hand-off, and reports what it got.
+kernel takes its own stack, validates the hand-off, wraps the firmware's
+framebuffer in the shared glyph console, and mirrors every message to both COM1
+and the screen.
 
 ```
 STAR OS loader v0.1.0 (x86_64 UEFI)
@@ -65,8 +67,15 @@ handoff: 30 regions, entry 0xffffffff80000000, boot info at 0x1de00000
 STAR OS microkernel (x86_64) v0.1.0
 boot info accepted: 30 memory regions, rsdp 0x1fb7e014, kernel 0x1dae7000+0x26000
 framebuffer: 1280x800 stride 5120 at 0x80000000 (4000 KiB)
-phase 1.1 complete: loaded by firmware, own stack, hand-off verified. Halting.
+console: mirroring to the screen (readback self-test passed)
+phase 1.2 complete: loaded by firmware, own stack, hand-off verified, console up. Halting.
 ```
+
+The screen is checked, not assumed: `run-qemu.sh --screenshot` dumps a frame
+through the QEMU monitor and `scripts/check-screen.py` counts lit pixels and
+compares the foreground colour. It expects `33ff66` — `Rgb::GREEN`, the one stock
+colour whose red and blue channels differ — because an inverted pixel-format
+mapping would render `66ff33` and nothing else would ever notice.
 
 `smoke-test.sh` also breaks the input on purpose — the aarch64 kernel on the
 ESP, a truncated image, no image at all — and checks each is refused by name and

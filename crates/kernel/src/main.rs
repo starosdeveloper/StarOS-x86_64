@@ -13,8 +13,10 @@
 #![no_std]
 #![no_main]
 
+mod console;
+
 use core::arch::naked_asm;
-use core::fmt::Write;
+use core::fmt::{self, Write};
 use core::panic::PanicInfo;
 
 use staros_arch_x86_64::cpu;
@@ -22,26 +24,7 @@ use staros_arch_x86_64::serial::Uart16550;
 use staros_bootinfo::{BootInfo, BootInfoError};
 use staros_hal::SerialConsole;
 
-/// A `core::fmt` sink over the serial console.
-///
-/// The aarch64 tree's `Pl011` implements `Write` directly; here the HAL trait and
-/// the formatting trait are bridged in the kernel, so the arch crate stays a
-/// description of hardware rather than of formatting.
-struct SerialWriter(Uart16550);
-
-impl Write for SerialWriter {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        for byte in s.bytes() {
-            // Terminals want CRLF; a kernel log that renders as a staircase is
-            // harder to read at exactly the moment reading it matters.
-            if byte == b'\n' {
-                self.0.write_byte(b'\r');
-            }
-            self.0.write_byte(byte);
-        }
-        Ok(())
-    }
-}
+use crate::console::Console;
 
 unsafe extern "C" {
     /// Top of the boot stack, from `crates/arch-x86_64/linker.ld`. The 4 KiB
@@ -95,16 +78,13 @@ pub unsafe extern "C" fn _start() -> ! {
 /// memory the loader has mapped. Called exactly once, by [`_start`].
 unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
     // The serial port is the only device available before anything is parsed, so
-    // it comes first — including before the boot info is trusted, because a
-    // rejected hand-off is precisely the case that needs to be reported.
-    let uart = Uart16550::com1();
+    // it comes first — including before the boot info is trusted, because the
+    // screen is described *by* that hand-off and a rejected one is precisely the
+    // case that needs to be reported.
     // SAFETY: first code to run after the loader; nothing else drives COM1.
-    let have_serial = unsafe { uart.init() };
-    let mut console = SerialWriter(uart);
+    let mut console = unsafe { Console::new() };
 
-    if have_serial {
-        let _ = writeln!(console, "\nSTAR OS microkernel (x86_64) v{}", env!("CARGO_PKG_VERSION"));
-    }
+    let _ = writeln!(console, "\nSTAR OS microkernel (x86_64) v{}", env!("CARGO_PKG_VERSION"));
 
     // SAFETY: the caller guarantees a valid, live pointer.
     let Some(info) = (unsafe { boot_info.as_ref() }) else {
@@ -146,23 +126,45 @@ unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
                 fb.phys,
                 fb.bytes() / 1024,
             );
+            // SAFETY: the loader mapped exactly `height * stride` bytes at this
+            // physical address (both identity and through the linear map) and
+            // nothing else in this kernel touches them. Called once.
+            match unsafe { console.attach_screen(fb) } {
+                Ok(()) => {
+                    let _ = writeln!(
+                        console,
+                        "console: mirroring to the screen (readback self-test passed)"
+                    );
+                    console.screen_selftest();
+                }
+                // Reported, not ignored: a display the firmware described and the
+                // kernel then failed to use is a bug that would otherwise present
+                // as "the screen stayed blank" with no explanation anywhere.
+                Err(why) => {
+                    let _ = writeln!(console, "console: screen unusable - {why}");
+                }
+            }
         }
         None => {
             let _ = writeln!(console, "framebuffer: none reported by firmware");
         }
     }
+    if !console.have_serial() && !console.have_screen() {
+        // Nothing above was seen by anyone. Nothing below will be either.
+        cpu::halt()
+    }
 
-    // Next: the framebuffer console, then GDT/IDT, then the kernel's own page
-    // tables and the frame pool. See docs/ROADMAP.md §1.2 onwards. Until those
-    // exist this is where the boot ends, and it ends by saying so rather than by
-    // wandering into unwritten code.
+    // Next: GDT/IDT, then the kernel's own page tables and the frame pool. See
+    // docs/ROADMAP.md §1.3 onwards. Until those exist this is where the boot
+    // ends, and it ends by saying so rather than by wandering into unwritten
+    // code.
     //
     // Interrupts are still masked and there is no IDT: the loader left them that
     // way deliberately, and re-enabling them before an IDT exists would turn the
     // first timer tick into a triple fault.
     let _ = writeln!(
         console,
-        "phase 1.1 complete: loaded by firmware, own stack, hand-off verified. Halting."
+        "phase 1.2 complete: loaded by firmware, own stack, hand-off verified, console up. Halting."
     );
     cpu::halt()
 }
@@ -174,7 +176,27 @@ unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
 /// false.
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    let mut console = SerialWriter(Uart16550::com1());
-    let _ = writeln!(console, "\nKERNEL PANIC: {info}");
+    // Serial directly, not through [`Console`]: the panicking code may be holding
+    // it — and later, once it is a locked global, may be holding its lock. A
+    // panic handler that can deadlock is a panic handler that eats the message
+    // explaining the panic.
+    let uart = Uart16550::com1();
+    let mut w = SerialOnly(uart);
+    let _ = writeln!(w, "\nKERNEL PANIC: {info}");
     cpu::halt()
+}
+
+/// The panic path's private sink. See [`panic`].
+struct SerialOnly(Uart16550);
+
+impl Write for SerialOnly {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for byte in s.bytes() {
+            if byte == b'\n' {
+                self.0.write_byte(b'\r');
+            }
+            self.0.write_byte(byte);
+        }
+        Ok(())
+    }
 }

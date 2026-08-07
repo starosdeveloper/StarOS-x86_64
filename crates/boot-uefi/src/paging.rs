@@ -24,11 +24,10 @@
 use crate::alloc::{alloc_pages, Error, PAGE_SIZE};
 use crate::efi::BootServices;
 
-/// Virtual base of the linear map of physical memory. Matches `docs/SPEC.md`
-/// §3.1 and the constant the kernel will use to translate physical addresses.
-pub const PHYS_MAP_BASE: u64 = 0xFFFF_8000_0000_0000;
-/// Virtual base of the kernel image, matching `crates/arch-x86_64/linker.ld`.
-pub const KERNEL_VMA: u64 = 0xFFFF_FFFF_8000_0000;
+// The address-space layout is a term of the hand-off, not a private choice of
+// the loader, so both constants come from the contract crate the kernel also
+// reads them from. Re-exported here because this is the module that uses them.
+pub use staros_bootinfo::{KERNEL_VMA, PHYS_MAP_BASE};
 
 /// 2 MiB.
 const SIZE_2M: u64 = 2 * 1024 * 1024;

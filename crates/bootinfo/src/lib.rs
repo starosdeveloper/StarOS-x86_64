@@ -30,6 +30,32 @@
 
 #![cfg_attr(not(test), no_std)]
 
+/// Virtual base of the linear map of physical memory.
+///
+/// The loader builds this map and the kernel inherits it, so the constant is one
+/// of the hand-off's terms — as much as any field of [`BootInfo`] — and lives
+/// here rather than in either binary. It matched by luck once already, which is
+/// exactly the kind of luck that stops holding after a refactor.
+///
+/// See `docs/SPEC.md` §3.1 for the whole layout.
+pub const PHYS_MAP_BASE: u64 = 0xFFFF_8000_0000_0000;
+
+/// Virtual base of the kernel image, matching `crates/arch-x86_64/linker.ld`.
+///
+/// The loader checks the image it loaded is linked here before it maps anything;
+/// disagreement between the two means a kernel running at an address its own code
+/// does not believe in, which fails in ways that look like hardware faults.
+pub const KERNEL_VMA: u64 = 0xFFFF_FFFF_8000_0000;
+
+/// The address a physical one is reachable at through the linear map.
+///
+/// Saturating rather than wrapping: an address so high that the linear map cannot
+/// reach it must not silently alias something low.
+#[must_use]
+pub const fn phys_to_virt(phys: u64) -> u64 {
+    PHYS_MAP_BASE.saturating_add(phys)
+}
+
 /// What the firmware said about one range of physical memory.
 ///
 /// Deliberately coarser than the UEFI memory-type enum: the kernel only needs to
@@ -178,6 +204,28 @@ pub enum PixelFormat {
     Bgrx8888 = 0,
     /// Red in the lowest byte. GOP's `PixelRedGreenBlueReserved8BitPerColor`.
     Rgbx8888 = 1,
+}
+
+impl PixelFormat {
+    /// The same byte order, in the drawing crate's vocabulary.
+    ///
+    /// **The names invert, and that is not a mistake in either crate.** GOP names
+    /// a format by its channels in *memory order* — `Bgrx8888` means blue is the
+    /// byte at offset 0. `staros_framebuffer` names one by the packed 32-bit word
+    /// on a little-endian machine — `xrgb8888` means the word is `0x00RRGGBB`,
+    /// whose lowest byte is blue. Same pixel, opposite-looking name.
+    ///
+    /// Getting it backwards is invisible in every test that checks addressing and
+    /// obvious the moment anything is drawn: the console comes up with red and
+    /// blue swapped. Hence a conversion with a test rather than a `match` written
+    /// out at the call site.
+    #[must_use]
+    pub const fn to_framebuffer(self) -> staros_framebuffer::PixelFormat {
+        match self {
+            Self::Bgrx8888 => staros_framebuffer::PixelFormat::xrgb8888(),
+            Self::Rgbx8888 => staros_framebuffer::PixelFormat::xbgr8888(),
+        }
+    }
 }
 
 /// Everything the kernel needs that it cannot discover for itself once the
@@ -493,5 +541,56 @@ mod tests {
         let map = [MemoryRegion::new(0, 64 * MIB, MemoryKind::Reserved)];
         assert_eq!(summarise(&map).largest_usable, None);
         assert_eq!(largest_free_run(&map, &[]), None);
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn the_linear_map_and_the_kernel_image_do_not_overlap() {
+        // Both live in the upper half, and the kernel image sits in the top 2 GiB
+        // *inside* the range the linear map would otherwise want. The layout in
+        // SPEC 3.1 stops the linear map short of it; this asserts the two
+        // constants still say so.
+        assert!(PHYS_MAP_BASE < KERNEL_VMA);
+        assert_eq!(KERNEL_VMA - PHYS_MAP_BASE, 0x7FFF_8000_0000);
+    }
+
+    #[test]
+    fn phys_to_virt_is_the_linear_map_and_saturates_instead_of_aliasing() {
+        assert_eq!(phys_to_virt(0), PHYS_MAP_BASE);
+        assert_eq!(phys_to_virt(0x8000_0000), PHYS_MAP_BASE + 0x8000_0000);
+        // An address that cannot be reached must not wrap round to a low one and
+        // quietly become a valid pointer to something else.
+        assert_eq!(phys_to_virt(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn gop_blue_first_is_the_drawing_crate_s_xrgb_and_the_names_invert() {
+        let fmt = PixelFormat::Bgrx8888.to_framebuffer();
+        assert_eq!(fmt, staros_framebuffer::PixelFormat::xrgb8888());
+        // The check that actually matters: blue must encode into byte 0.
+        assert_eq!(fmt.encode(0, 0, 0xFF), 0x0000_00FF);
+        assert_eq!(fmt.encode(0xFF, 0, 0), 0x00FF_0000);
+    }
+
+    #[test]
+    fn gop_red_first_is_the_drawing_crate_s_xbgr() {
+        let fmt = PixelFormat::Rgbx8888.to_framebuffer();
+        assert_eq!(fmt, staros_framebuffer::PixelFormat::xbgr8888());
+        assert_eq!(fmt.encode(0xFF, 0, 0), 0x0000_00FF);
+        assert_eq!(fmt.encode(0, 0, 0xFF), 0x00FF_0000);
+    }
+
+    #[test]
+    fn a_framebuffer_descriptor_sizes_its_own_mapping_by_stride() {
+        // 1366x768 is the classic mode where width*4 under-maps: the stride is
+        // padded to 1376 pixels.
+        let fb = Framebuffer::new(0x8000_0000, 1366, 768, 1376 * 4, PixelFormat::Bgrx8888);
+        assert!(fb.is_sane());
+        assert_eq!(fb.bytes(), 768 * 1376 * 4);
+        assert!(fb.bytes() > u64::from(fb.width) * u64::from(fb.height) * 4);
     }
 }
