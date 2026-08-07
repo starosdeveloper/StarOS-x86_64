@@ -46,3 +46,16 @@ pub fn interrupts_enabled() -> bool {
     unsafe { asm!("pushfq; pop {}", out(reg) flags, options(nomem, preserves_flags)) };
     flags & (1 << 9) != 0
 }
+
+/// The linear address that caused the most recent page fault, from `CR2`.
+///
+/// Read as early as possible in a `#PF` handler: `CR2` holds the *most recent*
+/// faulting address, not the one belonging to any particular frame, so a second
+/// page fault — including one taken by the reporting code itself — overwrites it.
+#[must_use]
+pub fn read_cr2() -> u64 {
+    let cr2: u64;
+    // SAFETY: reading a control register changes no state.
+    unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) };
+    cr2
+}

@@ -4,16 +4,18 @@
 //! [`BootInfo`] in `RDI`, after `ExitBootServices`: the firmware is gone, this
 //! code owns the machine, and nothing is set up that the loader did not set up.
 //!
-//! What runs today is the first link of the chain — take the kernel's own stack,
-//! validate the hand-off, bring up whatever console exists, and say so. Each
-//! following stage is specified in `docs/SPEC.md` and sequenced in
-//! `docs/ROADMAP.md`; they are absent here rather than stubbed, so the boot log
-//! cannot claim a subsystem that has not been written.
+//! What runs today is the first links of the chain — take the kernel's own
+//! stack, validate the hand-off, bring up whatever console exists, install the
+//! CPU tables, and prove they work by faulting on purpose. Each following stage
+//! is specified in `docs/SPEC.md` and sequenced in `docs/ROADMAP.md`; they are
+//! absent here rather than stubbed, so the boot log cannot claim a subsystem
+//! that has not been written.
 
 #![no_std]
 #![no_main]
 
 mod console;
+mod traps;
 
 use core::arch::naked_asm;
 use core::fmt::{self, Write};
@@ -24,7 +26,6 @@ use staros_arch_x86_64::serial::Uart16550;
 use staros_bootinfo::{BootInfo, BootInfoError};
 use staros_hal::SerialConsole;
 
-use crate::console::Console;
 
 unsafe extern "C" {
     /// Top of the boot stack, from `crates/arch-x86_64/linker.ld`. The 4 KiB
@@ -81,8 +82,9 @@ unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
     // it comes first — including before the boot info is trusted, because the
     // screen is described *by* that hand-off and a rejected one is precisely the
     // case that needs to be reported.
-    // SAFETY: first code to run after the loader; nothing else drives COM1.
-    let mut console = unsafe { Console::new() };
+    // SAFETY: first code to run after the loader; nothing else drives COM1, and
+    // this is the only initialisation.
+    let console = unsafe { console::init() };
 
     let _ = writeln!(console, "\nSTAR OS microkernel (x86_64) v{}", env!("CARGO_PKG_VERSION"));
 
@@ -154,19 +156,34 @@ unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
         cpu::halt()
     }
 
-    // Next: GDT/IDT, then the kernel's own page tables and the frame pool. See
-    // docs/ROADMAP.md §1.3 onwards. Until those exist this is where the boot
-    // ends, and it ends by saying so rather than by wandering into unwritten
-    // code.
+    // The CPU tables. Until they are loaded, every fault is a triple fault and
+    // therefore a silent reset — so this is the first thing after the console,
+    // and the console is first only because the tables need somewhere to report
+    // failures to.
     //
-    // Interrupts are still masked and there is no IDT: the loader left them that
-    // way deliberately, and re-enabling them before an IDT exists would turn the
-    // first timer tick into a triple fault.
+    // SAFETY: boot core, called once, interrupts still masked as the loader left
+    // them.
+    unsafe { traps::init() };
+    traps::describe(console);
+
+    // Two faults that come back, proving delivery and return both work.
+    traps::selftest_recoverable(console);
+
+    // Interrupts stay masked. The IDT can now catch a fault, but nothing is
+    // configured to *send* an interrupt: the 8259s are still in whatever state
+    // the firmware left them and the local APIC is untouched (docs/SPEC.md §4).
+    // `sti` here would deliver whatever they emit through vectors that mean
+    // something else entirely.
     let _ = writeln!(
         console,
-        "phase 1.2 complete: loaded by firmware, own stack, hand-off verified, console up. Halting."
+        "phase 1.3 complete: own stack, hand-off verified, console up, faults caught."
     );
-    cpu::halt()
+
+    // And one that does not come back. Last, deliberately: it is the only proof
+    // that the IST works, and the proof consumes the machine.
+    //
+    // SAFETY: nothing after this runs, which is the contract.
+    unsafe { traps::selftest_stack_guard(console) }
 }
 
 /// Panics stop this core and say why on whatever console exists.

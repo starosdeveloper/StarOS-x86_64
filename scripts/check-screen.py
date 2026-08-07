@@ -4,7 +4,8 @@
 A serial log cannot tell a blank display from a full one, so every mistake that
 belongs to the framebuffer alone is invisible in it: a wrong stride, a wrong
 channel order, or nothing drawn at all. This reads the PPM the monitor produced
-and checks the three things the log cannot.
+and checks the things the log cannot: that something was drawn, that the
+channel order is right, and that the fault report reached the panel too.
 
 Usage: check-screen.py <screendump.ppm>
 Prints a one-line summary on success; exits non-zero with a reason otherwise.
@@ -19,6 +20,18 @@ from collections import Counter
 # come out 0x66FF33 and nothing else in the system would ever notice.
 EXPECTED_FG = bytes((0x33, 0xFF, 0x66))
 BLACK = bytes(3)
+
+# A fault report is drawn in Rgb::RED instead, and the boot ends with one: a
+# deliberate stack overflow caught on the double-fault stack. Checking for it
+# here is the only evidence that a fault reaches the *panel* and not just the
+# serial port — which is the whole question on a machine that has no serial
+# port, and phase 3's board is exactly that machine.
+ALERT_FG = bytes((0xFF, 0x33, 0x33))
+
+# Six short lines of report in an 8x8 font. Far below what those lines cover,
+# and far above stray anti-aliasing (of which there is none: the console draws
+# glyphs as solid pixels).
+MIN_ALERT = 200
 
 # A screenful of the boot log plus the ASCII self-test lights several thousand
 # pixels. Well under that means the console attached but drew nothing.
@@ -57,7 +70,16 @@ def main() -> int:
         )
         return 1
 
-    print(f"{lit} lit pixels, foreground {foreground.hex()}")
+    alert = pixels.get(ALERT_FG, 0)
+    if alert < MIN_ALERT:
+        print(
+            f"no fault report on screen: {alert} pixels of {ALERT_FG.hex()},"
+            f" expected at least {MIN_ALERT}",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"{lit} lit pixels, foreground {foreground.hex()}, fault report {alert} px")
     return 0
 
 

@@ -6,11 +6,19 @@
 //! machine happens to have, and under QEMU it means the same lines are both
 //! captured in a file and visible on the emulated panel.
 //!
-//! ## Not a global, yet
-//! [`Console`] is an ordinary value that `kmain` owns and passes down, with no
-//! lock around it. That is honest for a kernel with one core, no interrupts and
-//! no user space: there is exactly one writer, and a lock would be a claim about
-//! concurrency that is not true here.
+//! ## A global, but not a lock
+//! [`Console`] lives in a static from [`init`] onwards, and [`get`] hands out a
+//! `&'static mut` to whoever asks. There is no lock, and that is honest for a
+//! kernel with one core, no device interrupts and no user space: there is one
+//! writer at a time.
+//!
+//! It has to be reachable from a static because of what phase 1.3 added. A trap
+//! handler is not called by anyone — the CPU enters it — so it cannot be handed
+//! a console, and a fault that cannot print is a fault that presents as a hang.
+//! The two `&mut` that briefly exist (the interrupted code's and the handler's)
+//! are never *used* at the same time: a trap suspends the interrupted
+//! instruction stream entirely, and when it resumes, the console's cursor has
+//! moved. Which is exactly what a mirrored log means.
 //!
 //! It stops being honest at phase 2.4, when the scheduler makes a second thing
 //! able to print, and again at 4.x with secondary cores. The aarch64 tree already
@@ -30,6 +38,46 @@ use staros_hal::SerialConsole;
 const FG: Rgb = Rgb::GREEN;
 /// Background colour.
 const BG: Rgb = Rgb::BLACK;
+/// Foreground colour for a fault report. See [`Console::set_alert`].
+const ALERT: Rgb = Rgb::RED;
+
+/// The console, once [`init`] has built it.
+static mut CONSOLE: Option<Console> = None;
+
+/// Bring up the console and place it in the static.
+///
+/// Returns the reference `kmain` prints through, so the ordinary boot path does
+/// not go through [`get`] and its unwrap.
+///
+/// # Safety
+/// Called once, before anything else drives COM1 or prints.
+pub unsafe fn init() -> &'static mut Console {
+    // SAFETY: first code to run after the loader; nothing else drives COM1.
+    let console = unsafe { Console::new() };
+    let slot = &raw mut CONSOLE;
+    // SAFETY: `CONSOLE` is private to this module, and the caller guarantees
+    // this is the only initialisation.
+    unsafe {
+        (*slot) = Some(console);
+        (*slot).as_mut().expect("just assigned")
+    }
+}
+
+/// The console, if one has been built.
+///
+/// `None` before [`init`], which is the window in which a trap has nowhere to
+/// report to.
+///
+/// # Safety
+/// The caller must not use the returned reference while another one obtained
+/// from here or from [`init`] is also being used. See the module documentation
+/// for why a trap handler satisfies that despite appearances.
+#[must_use]
+pub unsafe fn get() -> Option<&'static mut Console> {
+    let slot = &raw mut CONSOLE;
+    // SAFETY: forwarded from this function's contract.
+    unsafe { (*slot).as_mut() }
+}
 
 /// The console every kernel message goes through.
 pub struct Console {
@@ -115,6 +163,18 @@ impl Console {
         );
         self.screen = Some(screen);
         Ok(())
+    }
+
+    /// Switch the screen between the ordinary colour and the fault colour.
+    ///
+    /// Only the screen: a serial terminal's colours are the terminal's business,
+    /// and a fault report that emits escape sequences into a log file is worse to
+    /// read, not better. On a machine with no serial port this is the only thing
+    /// separating a fault report from the boot log around it.
+    pub fn set_alert(&mut self, alert: bool) {
+        if let Some(screen) = self.screen.as_mut() {
+            screen.set_fg(if alert { ALERT } else { FG });
+        }
     }
 
     /// Draw the printable ASCII range, so the font can be judged by eye.

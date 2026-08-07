@@ -101,7 +101,37 @@ expect "$L" "hand-off validated by the kernel" 'boot info accepted: [0-9]+ memor
 expect "$L" "kernel sees the framebuffer"    'framebuffer: [0-9]+x[0-9]+ stride'
 expect "$L" "screen attached, readback verified" 'console: mirroring to the screen \(readback self-test passed\)'
 forbid "$L" "screen described but unusable"  'console: screen unusable'
-expect "$L" "boot reached the end of phase 1.2" 'phase 1.2 complete'
+
+# --- phase 1.3: the CPU tables -------------------------------------------
+# Everything below is evidence that a fault is a report rather than a reset.
+# There is no other kind of evidence available: an IDT that is subtly wrong and
+# one that is right are both silent until something faults.
+expect "$L" "GDT loaded with the SYSCALL layout" 'gdt: loaded, kernel cs 0x08 ss 0x10, tss 0x30'
+expect "$L" "IDT loaded with all 256 vectors" 'idt: 256 vectors'
+# A vector with no error code, returning through iretq.
+expect "$L" "int3 was caught and resumed"    'trap: #BP at RIP=0x[0-9a-f]+, resuming'
+# A vector *with* an error code, resumed by rewriting RIP in the saved frame.
+# Address 0x0 is still identity-mapped by the loader until phase 1.4, so the
+# unmapped address used here is the stack guard page - which also proves the
+# guard is genuinely absent from the page tables.
+expect "$L" "page fault caught, decoded and resumed" \
+    'trap: #PF at 0xffffffff[0-9a-f]+, RIP=0x[0-9a-f]+, err=0x0 \(read from an unmapped page\), resuming at 0x'
+expect "$L" "both recoverable traps returned" 'both traps returned to their caller'
+expect "$L" "boot reached the end of phase 1.3" 'phase 1.3 complete'
+
+# The last act: a deliberate stack overflow. Without a TSS, an IST and a #DF
+# gate this is a triple fault and the log simply stops - which is exactly what
+# reverting `ist_for(8)` produces, and is why this is asserted rather than
+# assumed.
+expect "$L" "stack overflow reported, not reset" 'KERNEL FAULT: vector 8 - #DF double fault'
+expect "$L" "the guard page was named as the cause" 'that is the kernel stack guard page'
+expect "$L" "the fatal path halts"           'halting - this core cannot continue'
+# The frame is 22 words in a fixed order. Push one word too many or too few and
+# every field shifts: RIP reads as zero, and the iretq at the end of the stub
+# returns into nothing. Both halves of that signature are forbidden.
+forbid "$L" "trap frame shifted by a word"   'RIP=0x0,'
+forbid "$L" "fault while returning from a fault" 'KERNEL FAULT: vector 13'
+forbid "$L" "an unexpected fatal fault"      'KERNEL FAULT: vector (0|6|10|11|12|14) '
 
 # What a serial log cannot answer: was anything drawn, and in the right colours.
 check_screen "$LOG_DIR/screen.ppm"

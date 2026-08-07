@@ -60,4 +60,4 @@ kloader-clippy = "clippy -p staros-boot-uefi --bin staros-boot-uefi --target x86
 #
 # `--lib` matters: without it cargo also builds the `#![no_main]` loader binary,
 # which has no host `main` to link against. Its testable half is its library.
-ktest-host = "test --lib -p staros-acpi -p staros-bootinfo -p staros-elf64 -p staros-boot-uefi --target x86_64-unknown-linux-gnu"
+ktest-host = "test --lib -p staros-acpi -p staros-arch-x86-64 -p staros-bootinfo -p staros-elf64 -p staros-boot-uefi --target x86_64-unknown-linux-gnu"
