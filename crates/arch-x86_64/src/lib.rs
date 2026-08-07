@@ -17,30 +17,40 @@
 //!   stacks live.
 //! - [`idt`] — the 256 gates, and which of them switch stacks.
 //! - [`trap`] — the generated entry stubs, the saved frame, and the dispatcher.
+//! - [`pic`] — the two 8259s, which have to be moved off the exception vectors
+//!   before any interrupt can be enabled.
+//! - [`pit`] — the 8254, in the smallest form that can raise one real hardware
+//!   interrupt on demand.
 //! - [`selftest`] — faults taken on purpose, because a correct IDT and a subtly
 //!   wrong one are both silent until something faults.
 //!
-//! Everything else the port needs — paging, APIC, SMP, syscall entry — is
-//! scheduled in `docs/ROADMAP.md` and specified in `docs/SPEC.md`. They are
-//! listed there rather than stubbed here: an empty function that returns `Ok`
-//! is worse than an absent one, because the boot log then claims a subsystem
-//! came up.
+//! Everything else the port needs — APIC, SMP, syscall entry — is scheduled in
+//! `docs/ROADMAP.md` and specified in `docs/SPEC.md`. They are listed there
+//! rather than stubbed here: an empty function that returns `Ok` is worse than
+//! an absent one, because the boot log then claims a subsystem came up.
 //!
 //! ## Why this crate has host tests
 //! Most of it cannot have any — `lgdt` does nothing observable off a CPU. But
-//! the *encodings* can: a descriptor, a gate and a page-fault error code are bit
-//! layouts, and getting one wrong produces no message at all, just a reset. So
-//! the layouts are checked against literal values on the host, and only the
-//! instructions that install them are left to the machine. `#![no_std]` is
-//! therefore conditional: under `cfg(test)` the crate links against the host's
-//! `std` for the harness, and the modules that emit raw assembly are compiled
-//! out, since their absolute address tables cannot be relocated into a host PIE.
+//! the *encodings* can, and so can the *sequences*. A descriptor, a gate and a
+//! page-fault error code are bit layouts; an 8259 initialisation is eight
+//! control words whose meaning is positional. Getting either wrong produces no
+//! message at all — a reset, or an interrupt that never arrives. So the layouts
+//! are checked against literal values and the sequences against the exact list of
+//! port writes, and only the instructions that carry them out are left to the
+//! machine.
+//!
+//! `#![no_std]` is therefore conditional: under `cfg(test)` the crate links
+//! against the host's `std` for the harness, and the modules that emit raw
+//! assembly are compiled out, since their absolute address tables cannot be
+//! relocated into a host PIE.
 
 #![cfg_attr(not(test), no_std)]
 
 pub mod cpu;
 pub mod gdt;
 pub mod idt;
+pub mod pic;
+pub mod pit;
 pub mod port;
 #[cfg(not(test))]
 pub mod selftest;

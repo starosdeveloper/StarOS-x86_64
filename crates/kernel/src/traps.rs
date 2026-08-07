@@ -87,6 +87,16 @@ fn on_trap(frame: &mut TrapFrame) {
     // fault, including one taken inside this handler.
     let faulting_address = cpu::read_cr2();
 
+    // Device interrupts first, and without touching the console. They are the
+    // only traps here that are not a diagnosis: a timer tick is routine, it can
+    // arrive thousands of times a second, and printing a line for each one would
+    // turn a working interrupt controller into a machine that does nothing but
+    // describe itself.
+    if crate::irq::is_device_vector(frame.vector) {
+        crate::irq::dispatch(frame);
+        return;
+    }
+
     // SAFETY: single core, and a trap suspends whatever else held the console.
     // See `console`'s module documentation.
     let Some(console) = (unsafe { console::get() }) else {

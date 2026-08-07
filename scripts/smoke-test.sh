@@ -139,8 +139,32 @@ expect "$L" "a null dereference finally faults" \
 expect "$L" "SMAP refused a supervisor write to a user page" 'smap: the write faulted and did not happen'
 expect "$L" "stac still opens the hole"      'smap: stac opened the hole, the same write succeeded'
 expect "$L" "the frame pool coalesces"       'frames: [0-9]+ rounds of up to [0-9]+ allocations converged'
+
+# --- phase 2.1: device interrupts land where they should --------------------
+# The firmware leaves the 8259s delivering on vectors 0..15, which belong to the
+# CPU's own exceptions. The base is reported from the driver's record of where it
+# put them, not from the constant it was handed, so the line cannot agree with a
+# remap that did not happen.
+expect "$L" "the 8259 pair moved off the exception vectors" \
+    'pic: 8259 pair remapped to vectors 32\.\.48, masks 0xffff'
+forbid "$L" "a line came up unmasked"        'pic: WARNING'
+expect "$L" "the PIT was programmed as a rate generator" \
+    'pit: channel 0 at [0-9]+ Hz on IRQ 0, expecting vector 32'
+# The whole point of 2.1, and the only check that can be made: the 8259's vector
+# base is write-only, so where it delivers is a question only a delivered
+# interrupt can answer. Without the remap this same tick arrives as vector 0 and
+# the boot ends in "KERNEL FAULT: vector 0 - #DE divide error" - a division that
+# never happened. More than one tick, because one proves delivery but not
+# acknowledgement: a missing EOI leaves the line in service and the second never
+# comes.
+expect "$L" "timer interrupts delivered on the remapped vector and acknowledged" \
+    'irq: [0-9]+ timer interrupts delivered on vector 32 and acknowledged'
+expect "$L" "interrupts masked again afterwards" 'irq: interrupts masked again'
+forbid "$L" "an interrupt on a line nothing asked for" 'on lines nothing asked for'
+
 forbid "$L" "a self-test reported failure"   'SELF-TEST FAILED|did not converge|self-test FAILED'
-expect "$L" "boot reached the end of phase 1.4" 'phase 1.4 complete'
+forbid "$L" "a phase was claimed after a failure" 'not claiming phase'
+expect "$L" "boot reached the end of phase 2.1" 'phase 2.1 complete'
 
 # The last act: a deliberate stack overflow. Without a TSS, an IST and a #DF
 # gate this is a triple fault and the log simply stops - which is exactly what

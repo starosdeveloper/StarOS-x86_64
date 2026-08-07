@@ -30,11 +30,11 @@ cargo kbuild        # kernel ELF   -> x86_64-unknown-none
 cargo kloader       # loader EFI   -> x86_64-unknown-uefi
 cargo kclippy       # clippy, kernel
 cargo kloader-clippy
-cargo ktest-host    # the crates this tree owns (113 tests)
+cargo ktest-host    # the crates this tree owns (132 tests)
 
 ./scripts/mkesp.sh       # build both halves, stage an ESP layout
 ./scripts/run-qemu.sh    # boot it: OVMF -> BOOTX64.EFI -> kernel
-./scripts/smoke-test.sh  # boot it and assert on the output (56 assertions)
+./scripts/smoke-test.sh  # boot it and assert on the output (63 assertions)
 ```
 
 Shared crates are tested in `../kernel-new` (`cargo ktest-host` there), so their
@@ -45,7 +45,7 @@ partition; `run-qemu.sh --debug` starts stopped with a gdb stub on `:1234`.
 
 ## Status
 
-**Phase 1 complete, verified on live firmware.** OVMF finds
+**Phase 1 complete and phase 2.1 with it, verified on live firmware.** OVMF finds
 `EFI/BOOT/BOOTX64.EFI`; the loader collects the RSDP, the GOP framebuffer, the
 kernel and an optional initramfs off the ESP it was itself loaded from, places
 the `PT_LOAD` segments with their own rights (W^X), builds identity, linear and
@@ -53,9 +53,10 @@ kernel mappings, takes the memory map last, leaves boot services with the retry
 the specification requires, and jumps to `_start` with `BootInfo` in `RDI`. The
 kernel takes its own stack, validates the hand-off, mirrors every message to COM1
 and the screen, installs its own GDT, TSS and IDT, takes ownership of physical
-memory, builds its own page tables — and proves each of those by faulting on
-purpose, because a correct table and a subtly wrong one are both completely
-silent until something faults.
+memory, builds its own page tables, moves the 8259s off the CPU's exception
+vectors and runs with interrupts enabled for the first time — and proves each of
+those by faulting on purpose, because a correct table and a subtly wrong one are
+both completely silent until something faults.
 
 ```
 STAR OS microkernel (x86_64) v0.1.0
@@ -75,7 +76,11 @@ trap: #PF at 0x0, RIP=0xffffffff800172b8, err=0x0 (read from an unmapped page)
 smap: the write faulted and did not happen
 smap: stac opened the hole, the same write succeeded
 frames: 4 rounds of up to 64 allocations converged
-phase 1.4 complete: own stack, own tables, own memory, faults caught.
+pic: 8259 pair remapped to vectors 32..48, masks 0xffff
+pit: channel 0 at 1000 Hz on IRQ 0, expecting vector 32
+irq: 8 timer interrupts delivered on vector 32 and acknowledged
+irq: interrupts masked again until the APIC is up
+phase 2.1 complete: own memory, faults caught, device interrupts land where they should.
 
 KERNEL FAULT: vector 8 - #DF double fault
   the first fault was at 0xffffffff80043f68
@@ -94,6 +99,16 @@ message, and a successful store, which is indistinguishable from success in a
 log. And the last one overflows the stack into its guard page: the report exists
 only because `#DF` is delivered on its own IST stack. Remove that one line and the
 log stops mid-sentence with a triple fault.
+
+The timer ticks are the same kind of evidence. Firmware leaves the 8259 pair
+delivering on vectors 0 through 15, which belong to the CPU's exceptions, and the
+chips' vector base is write-only — there is no way to ask them where they are
+delivering. So the kernel remaps them, masks everything, starts the 8254, and
+counts. Eight ticks rather than one, because one proves delivery and not
+acknowledgement: without an EOI the line stays in service and the second never
+comes. Skip the remap and that same tick arrives as vector 0, ending the boot in
+`KERNEL FAULT: vector 0 - #DE divide error` — a division that never happened,
+which is exactly the class of lie the remap exists to prevent.
 
 The page tables themselves are not checked by booting. `staros-paging` abstracts
 the two things the loader and the kernel do differently — where a table frame

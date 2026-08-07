@@ -57,3 +57,50 @@ pub fn io_wait() {
     // machine this kernel will run on.
     unsafe { outb(0x80, 0) };
 }
+
+/// Access to the I/O port space, as a trait rather than as three free functions.
+///
+/// The legacy chips programmed through this space — the 8259s, the 8254 — are
+/// configured by writing magic bytes to fixed ports in a fixed order, and every
+/// byte means something different depending on where it falls in the sequence.
+/// None of that is visible from outside: the chips accept whatever they are
+/// given, and a wrong control word shows up as an interrupt that never arrives,
+/// somewhere else, later.
+///
+/// Behind a trait, the sequence becomes ordinary data. The host tests assert on
+/// the exact writes in the exact order, which is the only form in which the
+/// mistake is legible.
+///
+/// # Safety
+/// Implementors must direct reads and writes to the real port space, or to a
+/// faithful model of it. Callers assume a write has taken effect before the call
+/// returns.
+pub unsafe trait PortIo {
+    /// Write one byte to a port.
+    fn write(&mut self, port: u16, value: u8);
+    /// Read one byte from a port.
+    fn read(&mut self, port: u16) -> u8;
+    /// Spend a bus cycle, for chips that need settling time and offer no status
+    /// bit to poll. See [`io_wait`].
+    fn wait(&mut self);
+}
+
+/// The real port space.
+pub struct Ports;
+
+// SAFETY: these are the I/O port instructions themselves, and `io_wait` writes
+// the POST-code port, which no machine this kernel runs on reacts to.
+unsafe impl PortIo for Ports {
+    fn write(&mut self, port: u16, value: u8) {
+        // SAFETY: the ports reached through this type belong to the drivers that
+        // hold it, and each of them names the registers it programs.
+        unsafe { outb(port, value) };
+    }
+    fn read(&mut self, port: u16) -> u8 {
+        // SAFETY: as above.
+        unsafe { inb(port) }
+    }
+    fn wait(&mut self) {
+        io_wait();
+    }
+}

@@ -16,6 +16,7 @@
 
 mod console;
 mod heap;
+mod irq;
 mod mem;
 mod sync;
 mod traps;
@@ -236,18 +237,34 @@ unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
     );
 
     // Three things the log could not say before this point.
-    vm::selftest_null(console);
-    vm::selftest_smap(console, &tables);
-    mem::selftest(console);
+    let mut ok = vm::selftest_null(console);
+    ok &= vm::selftest_smap(console, &tables);
+    ok &= mem::selftest(console);
 
-    // Interrupts stay masked. The IDT can now catch a fault, but nothing is
-    // configured to *send* an interrupt: the 8259s are still in whatever state
-    // the firmware left them and the local APIC is untouched (docs/SPEC.md §4).
-    // `sti` here would deliver whatever they emit through vectors that mean
-    // something else entirely.
+    // The 8259s, which the firmware left enabled and delivering on the CPU's own
+    // exception vectors. Until they are moved, `sti` turns the first stray
+    // interrupt into a fault report naming an exception that never happened.
+    //
+    // SAFETY: boot core, called once, interrupts still masked — reprogramming a
+    // live interrupt controller is how one gets delivered mid-sequence.
+    unsafe { irq::init(console) };
+
+    // And the first time this kernel has ever run with interrupts enabled. The
+    // 8254 supplies one real hardware interrupt so the remap can be checked by
+    // something other than assertion: the 8259's vector base is write-only, so
+    // where it delivers is a question only a delivered interrupt can answer.
+    ok &= irq::selftest(console);
+
+    // The completion line is a claim, so it is only made when it is true. A boot
+    // that prints "complete" after a failed self-test is worse than one that
+    // prints nothing: it is the line a later reader will trust.
+    if !ok {
+        let _ = writeln!(console, "a self-test failed; not claiming phase 2.1. Halting.");
+        cpu::halt()
+    }
     let _ = writeln!(
         console,
-        "phase 1.4 complete: own stack, own tables, own memory, faults caught."
+        "phase 2.1 complete: own memory, faults caught, device interrupts land where they should."
     );
 
     // And one that does not come back. Last, deliberately: it is the only proof

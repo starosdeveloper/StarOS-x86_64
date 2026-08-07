@@ -281,7 +281,10 @@ pub fn largest_free_run() -> usize {
 /// Sizes and free order come from a fixed-seed xorshift, so a failure is
 /// reproducible — a random order that cannot be replayed is not a test, it is an
 /// anecdote.
-pub fn selftest(console: &mut crate::console::Console) {
+///
+/// Returns whether every round converged, so the boot does not go on to claim a
+/// phase it did not finish.
+pub fn selftest(console: &mut crate::console::Console) -> bool {
     use core::fmt::Write;
 
     /// xorshift64. Not for anything that needs to be unpredictable; this needs
@@ -313,7 +316,10 @@ pub fn selftest(console: &mut crate::console::Console) {
             n += 1;
         }
         if n == 0 {
-            let _ = writeln!(console, "frames: pool refused every allocation in round {round}");
+            let _ = writeln!(
+                console,
+                "frames SELF-TEST FAILED: the pool refused every allocation in round {round}"
+            );
             failures += 1;
             break;
         }
@@ -330,7 +336,8 @@ pub fn selftest(console: &mut crate::console::Console) {
         if after != before {
             let _ = writeln!(
                 console,
-                "frames: round {round} did not converge - {after} frames free, expected {before}"
+                "frames SELF-TEST FAILED: round {round} did not converge - \
+                 {after} frames free, expected {before}"
             );
             failures += 1;
         }
@@ -343,4 +350,5 @@ pub fn selftest(console: &mut crate::console::Console) {
              largest free run back to {before} frames (the page tables hold the rest)"
         );
     }
+    failures == 0
 }

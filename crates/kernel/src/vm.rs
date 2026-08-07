@@ -295,7 +295,7 @@ const SMAP_TEST_ADDR: u64 = 0x0000_0000_1000_0000;
 /// there: until this module ran, the low 4 GiB were identity-mapped by the
 /// loader and address zero was ordinary RAM. A null dereference read it and
 /// returned, which is the worst of both worlds — no fault, and a value.
-pub fn selftest_null(console: &mut Console) {
+pub fn selftest_null(console: &mut Console) -> bool {
     let _ = writeln!(console, "vm self-test: reading address 0x0");
     let slot = crate::traps::arm_page_fault(0);
     // SAFETY: the IDT is installed, the handler is armed to resume at `*slot`
@@ -304,8 +304,9 @@ pub fn selftest_null(console: &mut Console) {
     let taken = crate::traps::fault_was_taken();
     crate::traps::disarm();
     if !taken {
-        let _ = writeln!(console, "vm self-test FAILED: reading 0x0 did not fault");
+        let _ = writeln!(console, "vm SELF-TEST FAILED: reading 0x0 did not fault");
     }
+    taken
 }
 
 /// Prove SMAP is on: map a user page, write to it from ring 0, and check that
@@ -316,14 +317,16 @@ pub fn selftest_null(console: &mut Console) {
 /// exactly like success from the log alone. So the page is read back through the
 /// hole [`cpu::stac`] opens, and the value that must still be there is the one
 /// written before the test.
-pub fn selftest_smap(console: &mut Console, tables: &Tables) {
+pub fn selftest_smap(console: &mut Console, tables: &Tables) -> bool {
     if !tables.smap {
+        // Not a failure: a CPU without SMAP is a CPU without SMAP. The boot log
+        // has already said so on the `vm:` line, which is the honest place for it.
         let _ = writeln!(console, "smap: not supported by this CPU, self-test skipped");
-        return;
+        return true;
     }
     let Some(frame) = mem::alloc_frame() else {
-        let _ = writeln!(console, "smap: no frame for the self-test page");
-        return;
+        let _ = writeln!(console, "smap SELF-TEST FAILED: no frame for the self-test page");
+        return false;
     };
     let frame = frame.0 as u64;
     const SENTINEL: u64 = 0xC0FF_EE00_1234_5678;
@@ -339,9 +342,9 @@ pub fn selftest_smap(console: &mut Console, tables: &Tables) {
     let mut frames = KernelFrames;
     let mut mapper = Mapper::adopt(tables.root, &mut frames, tables.gib_pages);
     if let Err(e) = mapper.map(SMAP_TEST_ADDR, frame, PAGE_SIZE, Rights::RW.to_user()) {
-        let _ = writeln!(console, "smap: could not map the self-test page: {}", e.as_str());
+        let _ = writeln!(console, "smap SELF-TEST FAILED: could not map the page: {}", e.as_str());
         mem::free_frame(staros_mm::PhysAddr(frame as usize));
-        return;
+        return false;
     }
     // The tree is live, and the CPU may have cached the *absence* of this
     // translation just as readily as a translation itself.
@@ -362,15 +365,18 @@ pub fn selftest_smap(console: &mut Console, tables: &Tables) {
     // SAFETY: the linear map is a kernel mapping, so this read is unaffected by
     // SMAP and shows what the store above actually did.
     let value = unsafe { linear.read_volatile() };
+    let mut passed = true;
     match (faulted, value) {
         (true, SENTINEL) => {
             let _ = writeln!(console, "smap: the write faulted and did not happen");
         }
         (false, _) => {
             let _ = writeln!(console, "smap SELF-TEST FAILED: the write did not fault");
+            passed = false;
         }
         (true, _) => {
             let _ = writeln!(console, "smap SELF-TEST FAILED: it faulted but the store landed anyway");
+            passed = false;
         }
     }
 
@@ -389,6 +395,7 @@ pub fn selftest_smap(console: &mut Console, tables: &Tables) {
         let _ = writeln!(console, "smap: stac opened the hole, the same write succeeded");
     } else {
         let _ = writeln!(console, "smap SELF-TEST FAILED: stac did not permit the write");
+        passed = false;
     }
 
     // Put it back. Leaving a user-accessible mapping behind would be a hole in
@@ -397,4 +404,5 @@ pub fn selftest_smap(console: &mut Console, tables: &Tables) {
     // SAFETY: ring 0; the mapping was just removed and the TLB must forget it.
     unsafe { cpu::invlpg(SMAP_TEST_ADDR) };
     mem::free_frame(staros_mm::PhysAddr(frame as usize));
+    passed
 }
