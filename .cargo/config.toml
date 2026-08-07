@@ -23,7 +23,22 @@ target = "x86_64-unknown-none"
 #       relocation.
 #   "disable-redzone": true  — the red zone is unusable when an interrupt can
 #       land on any instruction; the CPU pushes its frame over those 128 bytes.
-rustflags = ["-C", "link-arg=-Tcrates/arch-x86_64/linker.ld"]
+#
+# Three flags, and each one is load-bearing:
+#
+#   link-arg=-T…       the layout above.
+#   relocation-model=static
+#   link-arg=-no-pie   without these the default is a position-independent
+#       executable: `readelf` reports `Type: DYN`, the image grows a `.dynamic`
+#       and a `.rela.dyn`, and the loader's ELF parser rightly refuses it. A
+#       kernel at a fixed virtual address has nothing to relocate *and* nobody to
+#       do the relocating — there is no dynamic linker on the other side of
+#       `ExitBootServices`.
+rustflags = [
+    "-C", "link-arg=-Tcrates/arch-x86_64/linker.ld",
+    "-C", "relocation-model=static",
+    "-C", "link-arg=-no-pie",
+]
 
 # Convenience aliases, matching `../kernel-new`'s so muscle memory carries over.
 #   * kernel builds carry `build-std` (core/alloc from source for the memory
@@ -32,6 +47,17 @@ rustflags = ["-C", "link-arg=-Tcrates/arch-x86_64/linker.ld"]
 [alias]
 kbuild = "build -p kernel -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem"
 kclippy = "clippy -p kernel -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem"
+
+# The loader is a *different* target: PE/COFF for firmware, not ELF for hardware
+# (docs/SPEC.md §2.1). `--target` on the command line overrides `[build] target`
+# above, and the linker-script rustflags are scoped to `x86_64-unknown-none`, so
+# neither leaks into this build.
+kloader = "build -p staros-boot-uefi --bin staros-boot-uefi --target x86_64-unknown-uefi -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem"
+kloader-clippy = "clippy -p staros-boot-uefi --bin staros-boot-uefi --target x86_64-unknown-uefi -Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem"
+
 # The pure-logic tests, on the host. Shared crates are tested in ../kernel-new;
 # these are the ones this tree owns.
-ktest-host = "test -p staros-acpi -p staros-bootinfo --target x86_64-unknown-linux-gnu"
+#
+# `--lib` matters: without it cargo also builds the `#![no_main]` loader binary,
+# which has no host `main` to link against. Its testable half is its library.
+ktest-host = "test --lib -p staros-acpi -p staros-bootinfo -p staros-elf64 -p staros-boot-uefi --target x86_64-unknown-linux-gnu"

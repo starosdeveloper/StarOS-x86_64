@@ -38,6 +38,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "staros-boot-uefi"
+version = "0.1.0"
+dependencies = [
+ "staros-arch-x86-64",
+ "staros-bootinfo",
+ "staros-elf64",
+ "staros-hal",
+]
+
+[[package]]
 name = "staros-bootinfo"
 version = "0.1.0"
 
@@ -52,6 +62,10 @@ dependencies = [
  "staros-abi",
  "staros-hal",
 ]
+
+[[package]]
+name = "staros-elf64"
+version = "0.1.0"
 
 [[package]]
 name = "staros-framebuffer"

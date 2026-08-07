@@ -1,0 +1,34 @@
+[package]
+name = "staros-boot-uefi"
+description = "STAR OS UEFI loader — collects the machine description, places the kernel, leaves boot services"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+# `BOOTX64.EFI` when copied to the ESP, but the crate keeps its own name so
+# `cargo build -p staros-boot-uefi` is unambiguous; scripts/mkesp.sh does the
+# rename, since the removable-media boot path is a firmware convention rather
+# than a property of this binary.
+[lib]
+name = "staros_boot_uefi"
+path = "src/lib.rs"
+
+# `test = false`: the binary is `#![no_main]` and only links for
+# `x86_64-unknown-uefi`. Its testable half is the library above.
+[[bin]]
+name = "staros-boot-uefi"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+staros-bootinfo.workspace = true
+staros-elf64.workspace = true
+staros-arch-x86-64.workspace = true
+staros-hal.workspace = true

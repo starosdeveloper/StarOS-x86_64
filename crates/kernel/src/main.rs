@@ -4,15 +4,16 @@
 //! [`BootInfo`] in `RDI`, after `ExitBootServices`: the firmware is gone, this
 //! code owns the machine, and nothing is set up that the loader did not set up.
 //!
-//! What runs today is the first link of the chain — validate the hand-off, bring
-//! up whatever console exists, and say so. Each following stage is specified in
-//! `docs/SPEC.md` and sequenced in `docs/ROADMAP.md`; they are absent here rather
-//! than stubbed, so the boot log cannot claim a subsystem that has not been
-//! written.
+//! What runs today is the first link of the chain — take the kernel's own stack,
+//! validate the hand-off, bring up whatever console exists, and say so. Each
+//! following stage is specified in `docs/SPEC.md` and sequenced in
+//! `docs/ROADMAP.md`; they are absent here rather than stubbed, so the boot log
+//! cannot claim a subsystem that has not been written.
 
 #![no_std]
 #![no_main]
 
+use core::arch::naked_asm;
 use core::fmt::Write;
 use core::panic::PanicInfo;
 
@@ -42,19 +43,57 @@ impl Write for SerialWriter {
     }
 }
 
+unsafe extern "C" {
+    /// Top of the boot stack, from `crates/arch-x86_64/linker.ld`. The 4 KiB
+    /// below `__stack_bottom` are a guard page that no `PT_LOAD` segment covers,
+    /// so the loader never maps it and an overflow faults instead of eating
+    /// `.bss`.
+    static __stack_top: u8;
+}
+
 /// Kernel entry point.
 ///
-/// `extern "C"` and one argument: the loader jumps here with the boot info
-/// pointer in `RDI`, which is the System V ABI's first integer argument. That
-/// makes the hand-off an ordinary function call rather than a private convention
-/// — the same reasoning as taking the DTB in `x0` on aarch64.
+/// Naked, and the first thing it does is take the kernel's own stack. On entry
+/// `RSP` still points into the loader's stack — memory that is about to be
+/// reclaimed, and that lives in the identity map the kernel is going to tear
+/// down. Nothing may be pushed there, which rules out ordinary Rust code, so
+/// this stub is assembly and hands off the moment the stack is ours.
+///
+/// `RDI` is untouched, so the boot-info pointer the loader placed there arrives
+/// at [`kmain`] as its first argument under the System V ABI — the same reasoning
+/// as taking the DTB in `x0` on aarch64.
+///
+/// # Safety
+/// Entered exactly once, by the loader, with `RDI` holding a valid [`BootInfo`]
+/// pointer and the kernel image mapped as `linker.ld` lays it out. Nothing in
+/// Rust may call this: it does not return and it replaces the stack.
+#[unsafe(naked)]
+#[no_mangle]
+#[link_section = ".text.start"]
+pub unsafe extern "C" fn _start() -> ! {
+    naked_asm!(
+        // The stack top is 4 KiB aligned; `call` then pushes 8 bytes, which is
+        // exactly the alignment System V expects at a function's first
+        // instruction.
+        "lea rsp, [rip + {stack_top}]",
+        // End the frame-pointer chain here, so a future backtrace stops at the
+        // entry instead of walking into whatever the loader left behind.
+        "xor rbp, rbp",
+        "call {kmain}",
+        // kmain is `-> !`. Reaching this is a contradiction, and `ud2` turns it
+        // into an invalid-opcode fault rather than a silent walk into .rodata.
+        "ud2",
+        stack_top = sym __stack_top,
+        kmain = sym kmain,
+    )
+}
+
+/// The kernel proper, entered on the kernel's own stack.
 ///
 /// # Safety
 /// `boot_info` must point to a valid [`BootInfo`] that outlives this call, in
-/// memory the loader has mapped. Called exactly once, by the loader.
-#[no_mangle]
-#[link_section = ".text.start"]
-pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
+/// memory the loader has mapped. Called exactly once, by [`_start`].
+unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
     // The serial port is the only device available before anything is parsed, so
     // it comes first — including before the boot info is trusted, because a
     // rejected hand-off is precisely the case that needs to be reported.
@@ -113,10 +152,18 @@ pub unsafe extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         }
     }
 
-    // Next: the memory map into a frame allocator, then paging, GDT/IDT, APIC.
-    // See docs/ROADMAP.md phase 1. Until those exist this is where the boot ends,
-    // and it ends by saying so rather than by wandering into unwritten code.
-    let _ = writeln!(console, "phase 0 complete: hand-off verified, console up. Halting.");
+    // Next: the framebuffer console, then GDT/IDT, then the kernel's own page
+    // tables and the frame pool. See docs/ROADMAP.md §1.2 onwards. Until those
+    // exist this is where the boot ends, and it ends by saying so rather than by
+    // wandering into unwritten code.
+    //
+    // Interrupts are still masked and there is no IDT: the loader left them that
+    // way deliberately, and re-enabling them before an IDT exists would turn the
+    // first timer tick into a triple fault.
+    let _ = writeln!(
+        console,
+        "phase 1.1 complete: loaded by firmware, own stack, hand-off verified. Halting."
+    );
     cpu::halt()
 }
 

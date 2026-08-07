@@ -27,6 +27,7 @@ PHDRS
     text   PT_LOAD FLAGS(5);  /* R-X */
     rodata PT_LOAD FLAGS(4);  /* R-- */
     data   PT_LOAD FLAGS(6);  /* RW- */
+    stack  PT_LOAD FLAGS(6);  /* RW- , separated from .data by the guard page */
 }
 
 SECTIONS
@@ -56,17 +57,25 @@ SECTIONS
         __bss_end = .;
     } :data
 
-    /* The boot stack lives in .bss so it costs nothing in the image, and is
-     * page-aligned with a deliberately unmapped guard page below it: a kernel
-     * stack overflow must fault rather than quietly overwrite .bss, which is the
-     * failure mode that produces impossible bug reports. */
+    /* The boot stack costs nothing in the image (NOLOAD) and is preceded by a
+     * guard page that is genuinely unmapped — a kernel stack overflow must fault
+     * rather than quietly overwrite .bss, which is the failure mode that produces
+     * impossible bug reports.
+     *
+     * The guard is real because of how it is placed: the location counter is
+     * advanced across it *outside* any output section, so no PT_LOAD covers those
+     * 4 KiB and the loader, which maps segment by segment, has nothing to map
+     * there. That is also why .stack needs its own program header — sharing
+     * :data would stretch that segment across the gap and map it after all. */
+    . = ALIGN(4K);
+    __stack_guard = .;
+    . += 4K;
+
     .stack (NOLOAD) : ALIGN(4K) {
-        __stack_guard = .;
-        . += 4K;            /* guard page: never mapped */
         __stack_bottom = .;
         . += 64K;
         __stack_top = .;
-    } :data
+    } :stack
 
     . = ALIGN(4K);
     __kernel_end = .;
