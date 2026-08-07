@@ -16,6 +16,7 @@ dependencies = [
  "staros-hal",
  "staros-ipc",
  "staros-mm",
+ "staros-paging",
 ]
 
 [[package]]
@@ -45,6 +46,7 @@ dependencies = [
  "staros-bootinfo",
  "staros-elf64",
  "staros-hal",
+ "staros-paging",
 ]
 
 [[package]]
@@ -94,3 +96,7 @@ version = "0.2.0"
 dependencies = [
  "staros-abi",
 ]
+
+[[package]]
+name = "staros-paging"
+version = "0.1.0"

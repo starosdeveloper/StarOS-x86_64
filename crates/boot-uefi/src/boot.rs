@@ -189,7 +189,7 @@ pub unsafe fn run(
     // IDT installed, which is a silent reset rather than a message.
     // SAFETY: `bs` is live; the tree is not in CR3 yet.
     unsafe {
-        tables.map(bs, 0, 0, mapped, Rights { write: true, exec: true })?;
+        tables.map(bs, 0, 0, mapped, Rights { write: true, exec: true, user: false })?;
         tables.map(bs, PHYS_MAP_BASE, 0, mapped, Rights::RW)?;
     }
     // The framebuffer is normally an aperture below 4 GiB and already inside the
@@ -205,7 +205,7 @@ pub unsafe fn run(
             extra_fb = end - base;
             // SAFETY: `bs` is live; the tree is not in CR3 yet.
             unsafe {
-                tables.map(bs, base, base, extra_fb, Rights { write: true, exec: false })?;
+                tables.map(bs, base, base, extra_fb, Rights::RW)?;
                 tables.map(bs, PHYS_MAP_BASE + base, base, extra_fb, Rights::RW)?;
             }
         }

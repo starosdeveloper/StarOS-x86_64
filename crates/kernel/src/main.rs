@@ -15,7 +15,11 @@
 #![no_main]
 
 mod console;
+mod heap;
+mod mem;
+mod sync;
 mod traps;
+mod vm;
 
 use core::arch::naked_asm;
 use core::fmt::{self, Write};
@@ -169,6 +173,73 @@ unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
     // Two faults that come back, proving delivery and return both work.
     traps::selftest_recoverable(console);
 
+    // Take ownership of memory: copy the map out of the loader's buffers, carve
+    // the heap, build the frame pool.
+    //
+    // SAFETY: the hand-off has been validated above and nothing has allocated
+    // yet, so the loader's memory-map buffer is still intact. Called once.
+    let layout = match unsafe { mem::init(info, boot_info as u64) } {
+        Ok(layout) => layout,
+        Err(e) => {
+            let _ = writeln!(console, "memory: {}", e.as_str());
+            cpu::halt()
+        }
+    };
+    let _ = writeln!(
+        console,
+        "memory: {} MiB described, {} MiB usable, RAM tops out at {:#x}",
+        layout.total / (1024 * 1024),
+        layout.usable / (1024 * 1024),
+        layout.highest_ram,
+    );
+    if layout.highest != layout.highest_ram {
+        // The gap between the two is a device aperture. Following it would build
+        // a terabyte of linear map for a machine with half a gigabyte of RAM,
+        // which is exactly what the loader did before it learned to filter.
+        let _ = writeln!(
+            console,
+            "memory: device apertures reach {:#x}; the linear map stops at RAM",
+            layout.highest,
+        );
+    }
+    mem::describe(console);
+    let _ = writeln!(
+        console,
+        "memory: heap {} KiB at {:#x}, pool {} MiB at {:#x} ({} frames managed)",
+        layout.heap.1 / 1024,
+        layout.heap.0,
+        layout.pool.1 / (1024 * 1024),
+        layout.pool.0,
+        layout.managed_frames,
+    );
+
+    // The kernel's own page tables. After this the loader's tree is gone, and
+    // with it the identity map that has been keeping address zero alive.
+    //
+    // SAFETY: the frame pool exists, this is the boot core, interrupts are
+    // masked, and `kernel_phys` comes from the validated hand-off.
+    let tables = match unsafe { vm::init(console, info.kernel_phys, layout.highest_ram, info.framebuffer()) } {
+        Ok(tables) => tables,
+        Err(e) => {
+            let _ = writeln!(console, "vm: refusing to switch tables - {e}");
+            cpu::halt()
+        }
+    };
+    let _ = writeln!(
+        console,
+        "vm: cr3 {:#x}, linear {} GiB ({} pages), smep {}, smap {}",
+        tables.root,
+        tables.linear_bytes / (1024 * 1024 * 1024),
+        if tables.gib_pages { "1 GiB" } else { "2 MiB" },
+        if tables.smep { "on" } else { "unsupported" },
+        if tables.smap { "on" } else { "unsupported" },
+    );
+
+    // Three things the log could not say before this point.
+    vm::selftest_null(console);
+    vm::selftest_smap(console, &tables);
+    mem::selftest(console);
+
     // Interrupts stay masked. The IDT can now catch a fault, but nothing is
     // configured to *send* an interrupt: the 8259s are still in whatever state
     // the firmware left them and the local APIC is untouched (docs/SPEC.md §4).
@@ -176,7 +247,7 @@ unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
     // something else entirely.
     let _ = writeln!(
         console,
-        "phase 1.3 complete: own stack, hand-off verified, console up, faults caught."
+        "phase 1.4 complete: own stack, own tables, own memory, faults caught."
     );
 
     // And one that does not come back. Last, deliberately: it is the only proof

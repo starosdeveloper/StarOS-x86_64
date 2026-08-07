@@ -1,0 +1,12 @@
+[package]
+name = "staros-paging"
+description = "x86_64 four-level page tables, as logic: shared by the loader and the kernel"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

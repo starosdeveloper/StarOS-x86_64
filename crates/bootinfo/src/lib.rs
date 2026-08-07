@@ -333,8 +333,22 @@ pub struct MemoryStats {
     pub total_bytes: u64,
     /// The largest single usable range, or `None` if there is none.
     pub largest_usable: Option<(u64, u64)>,
-    /// Highest address any region reaches — how far the linear map must span.
+    /// Highest address any region reaches, device apertures included.
     pub highest_address: u64,
+    /// Highest address reached by anything that is actually *memory*.
+    ///
+    /// This, not [`MemoryStats::highest_address`], is how far the linear map has
+    /// to span. The distinction is not academic: a q35 machine parks twelve
+    /// gigabytes of reserved device space at 1012 GiB, and counting it built a
+    /// terabyte of mappings for a machine with 512 MiB of RAM.
+    ///
+    /// [`MemoryKind::Reserved`] is the kind that is excluded, and it is the only
+    /// one that can be either — UEFI's reserved *memory* and its memory-mapped
+    /// *I/O* both arrive as `Reserved`, so a range that might be an aperture is
+    /// treated as one. The cost of being wrong in this direction is a page of
+    /// firmware memory the kernel has to map deliberately; in the other, it is
+    /// gigabytes of page tables.
+    pub highest_ram: u64,
 }
 
 /// Summarise a memory map.
@@ -350,6 +364,9 @@ pub fn summarise(regions: &[MemoryRegion]) -> MemoryStats {
         }
         stats.total_bytes = stats.total_bytes.saturating_add(r.len);
         stats.highest_address = stats.highest_address.max(r.end());
+        if r.kind != MemoryKind::Reserved {
+            stats.highest_ram = stats.highest_ram.max(r.end());
+        }
         if r.kind.usable_at_boot() {
             stats.usable_bytes = stats.usable_bytes.saturating_add(r.len);
             let better = match stats.largest_usable {
@@ -482,6 +499,42 @@ mod tests {
         assert_eq!(s.total_bytes, (64 + 16 + 512 + 8) * MIB);
         assert_eq!(s.largest_usable, Some((0x1_0000_0000, 512 * MIB)));
         assert_eq!(s.highest_address, 0x2_0000_0000 + 8 * MIB);
+        assert_eq!(s.highest_ram, 0x2_0000_0000 + 8 * MIB);
+    }
+
+    #[test]
+    fn a_device_aperture_does_not_stretch_the_ram_extent() {
+        // The shape a q35 machine really produces: half a gigabyte of RAM, and
+        // twelve gigabytes of reserved device space parked at 1012 GiB. Counting
+        // the aperture as memory built a terabyte of linear map for it.
+        let map = [
+            MemoryRegion::new(0, 512 * MIB, MemoryKind::Usable),
+            MemoryRegion::new(0xFD_0000_0000, 12 * 1024 * MIB, MemoryKind::Reserved),
+        ];
+        let s = summarise(&map);
+        assert_eq!(s.highest_ram, 512 * MIB, "the aperture was counted as memory");
+        // The unfiltered figure still reports it, because something has to.
+        assert_eq!(s.highest_address, 0xFD_0000_0000 + 12 * 1024 * MIB);
+    }
+
+    #[test]
+    fn every_kind_but_reserved_counts_as_ram() {
+        // ACPI tables, NVS, the loader's own pages and even memory the firmware
+        // called bad are all real, addressable RAM: the kernel has to be able to
+        // reach them through the linear map. `Reserved` is the only kind that
+        // might be an MMIO window rather than memory.
+        for kind in [
+            MemoryKind::Usable,
+            MemoryKind::AcpiReclaimable,
+            MemoryKind::AcpiNvs,
+            MemoryKind::LoaderReclaimable,
+            MemoryKind::BadMemory,
+        ] {
+            let s = summarise(&[MemoryRegion::new(0, 4 * MIB, kind)]);
+            assert_eq!(s.highest_ram, 4 * MIB, "{kind:?} was treated as an aperture");
+        }
+        let s = summarise(&[MemoryRegion::new(0, 4 * MIB, MemoryKind::Reserved)]);
+        assert_eq!(s.highest_ram, 0);
     }
 
     #[test]

@@ -29,6 +29,7 @@ bench = false
 
 [dependencies]
 staros-bootinfo.workspace = true
+staros-paging.workspace = true
 staros-elf64.workspace = true
 staros-arch-x86-64.workspace = true
 staros-hal.workspace = true

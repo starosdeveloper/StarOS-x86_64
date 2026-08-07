@@ -35,16 +35,28 @@ SECTIONS
     . = KERNEL_VMA;
     __kernel_start = .;
 
+    /* The three section boundaries below are not decoration: from phase 1.4 the
+     * kernel maps its own image one section at a time, and these symbols are the
+     * only place the boundaries exist. Each is 4 KiB aligned because a mapping
+     * cannot be finer than a page - a rodata page that shares a page with text
+     * has to be granted execute, and W^X quietly stops being true. */
     .text : ALIGN(4K) {
+        __text_start = .;
         *(.text.start)      /* the entry point first, so its address is known */
         *(.text .text.*)
+        . = ALIGN(4K);
+        __text_end = .;
     } :text
 
     .rodata : ALIGN(4K) {
+        __rodata_start = .;
         *(.rodata .rodata.*)
+        . = ALIGN(4K);
+        __rodata_end = .;
     } :rodata
 
     .data : ALIGN(4K) {
+        __data_start = .;
         *(.data .data.*)
         *(.got .got.plt)    /* should be empty under the kernel code model */
     } :data

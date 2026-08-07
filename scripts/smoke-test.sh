@@ -117,7 +117,30 @@ expect "$L" "int3 was caught and resumed"    'trap: #BP at RIP=0x[0-9a-f]+, resu
 expect "$L" "page fault caught, decoded and resumed" \
     'trap: #PF at 0xffffffff[0-9a-f]+, RIP=0x[0-9a-f]+, err=0x0 \(read from an unmapped page\), resuming at 0x'
 expect "$L" "both recoverable traps returned" 'both traps returned to their caller'
-expect "$L" "boot reached the end of phase 1.3" 'phase 1.3 complete'
+
+# --- phase 1.4: the kernel's own memory ------------------------------------
+expect "$L" "memory map summarised"          'memory: [0-9]+ MiB described, [0-9]+ MiB usable, RAM tops out at 0x'
+expect "$L" "the map itself is printed"      '^  0x[0-9a-f]+\.\.0x[0-9a-f]+ +[0-9]+ KiB  usable'
+expect "$L" "heap and pool carved"           'memory: heap [0-9]+ KiB at 0x[0-9a-f]+, pool [0-9]+ MiB at 0x[0-9a-f]+ \([0-9]+ frames managed\)'
+# The tree is walked before it is loaded, because a bad `mov cr3` is a triple
+# fault with nothing printed - there is no fault report to read afterwards.
+expect "$L" "the new tree verified before the switch" \
+    'vm: verified - text 0x[0-9a-f]+ r-x, rodata r--, data rw-, 0x0 and the guard page absent'
+forbid "$L" "the tree failed verification"   'vm: refusing to switch tables'
+expect "$L" "own tables live, protections on" 'vm: cr3 0x[0-9a-f]+, linear 4 GiB \(1 GiB pages\), smep on, smap on'
+# The same device aperture that stretched the loader's map to 1024 GiB: by the
+# time the kernel sees the map, UEFI's MMIO type has been folded into Reserved,
+# so the filter has to be redone on this side.
+forbid "$L" "linear map stretched by an aperture" 'linear [0-9]{3,} GiB'
+# Phase 1.3 could not meet this: the loader identity-maps the low 4 GiB, so a
+# null dereference read real memory and returned. It is true only now.
+expect "$L" "a null dereference finally faults" \
+    'trap: #PF at 0x0, RIP=0x[0-9a-f]+, err=0x0 \(read from an unmapped page\)'
+expect "$L" "SMAP refused a supervisor write to a user page" 'smap: the write faulted and did not happen'
+expect "$L" "stac still opens the hole"      'smap: stac opened the hole, the same write succeeded'
+expect "$L" "the frame pool coalesces"       'frames: [0-9]+ rounds of up to [0-9]+ allocations converged'
+forbid "$L" "a self-test reported failure"   'SELF-TEST FAILED|did not converge|self-test FAILED'
+expect "$L" "boot reached the end of phase 1.4" 'phase 1.4 complete'
 
 # The last act: a deliberate stack overflow. Without a TSS, an IST and a #DF
 # gate this is a triple fault and the log simply stops - which is exactly what

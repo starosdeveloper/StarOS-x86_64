@@ -4,6 +4,7 @@ members = [
     "crates/acpi",
     "crates/bootinfo",
     "crates/elf64",
+    "crates/paging",
     "crates/arch-x86_64",
     "crates/kernel",
     "crates/boot-uefi",
@@ -52,6 +53,7 @@ staros-drivers = { path = "../kernel-new/crates/drivers" }
 staros-acpi = { path = "crates/acpi" }
 staros-bootinfo = { path = "crates/bootinfo" }
 staros-elf64 = { path = "crates/elf64" }
+staros-paging = { path = "crates/paging" }
 staros-arch-x86-64 = { path = "crates/arch-x86_64" }
 
 # Same lint discipline as the aarch64 tree: a second architecture is not an

@@ -11,7 +11,7 @@
 //! would mean continuing with an invariant already known to be false.
 
 use core::fmt::Write;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use staros_arch_x86_64::trap::{PageFaultCause, TrapFrame};
 use staros_arch_x86_64::{cpu, gdt, idt, selftest, trap};
@@ -33,6 +33,14 @@ static RESUME_AT: AtomicU64 = AtomicU64::new(0);
 
 /// The address the armed self-test expects to fault on.
 static EXPECT_FAULT_AT: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a self-test is armed at all. Separate from the address, because zero
+/// became a legitimate address to expect a fault at the moment the kernel
+/// stopped identity-mapping it.
+static ARMED: AtomicBool = AtomicBool::new(false);
+
+/// One past the last user address. Everything below the canonical hole.
+const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
 
 unsafe extern "C" {
     /// First byte of the stack guard page, from `crates/arch-x86_64/linker.ld`.
@@ -103,7 +111,10 @@ fn on_trap(frame: &mut TrapFrame) {
 ///
 /// Returns whether the trap was consumed.
 fn resume_if_expected(console: &mut Console, frame: &mut TrapFrame, address: u64) -> bool {
-    if frame.vector != VECTOR_PAGE_FAULT || RESUME_AT.load(Ordering::SeqCst) == 0 {
+    if !ARMED.load(Ordering::SeqCst)
+        || frame.vector != VECTOR_PAGE_FAULT
+        || RESUME_AT.load(Ordering::SeqCst) == 0
+    {
         return false;
     }
     if address != EXPECT_FAULT_AT.load(Ordering::SeqCst) {
@@ -113,14 +124,16 @@ fn resume_if_expected(console: &mut Console, frame: &mut TrapFrame, address: u64
         return false;
     }
     let resume = RESUME_AT.swap(0, Ordering::SeqCst);
+    ARMED.store(false, Ordering::SeqCst);
     let cause = PageFaultCause::from_error_code(frame.error_code);
     let _ = writeln!(
         console,
-        "trap: #PF at {:#x}, RIP={:#x}, err={:#x} ({}), resuming at {:#x}",
+        "trap: #PF at {:#x}, RIP={:#x}, err={:#x} ({}{}), resuming at {:#x}",
         address,
         frame.rip,
         frame.error_code,
         cause.as_str(),
+        if smap_suspected(address, cause) { ", supervisor access to a user page - SMAP" } else { "" },
         resume,
     );
     // The whole point of the exercise: `iretq` reloads RIP from the frame, so
@@ -155,6 +168,13 @@ fn report(console: &mut Console, frame: &TrapFrame, address: u64) {
     if frame.vector == VECTOR_PAGE_FAULT {
         let cause = PageFaultCause::from_error_code(frame.error_code);
         let _ = writeln!(console, "  #PF at {:#x}: {}", address, cause.as_str());
+        if smap_suspected(address, cause) {
+            // The error code cannot say this on its own: a SMAP violation and a
+            // write to a read-only page produce the same five bits. What
+            // separates them is that the target is a user address and the access
+            // was not.
+            let _ = writeln!(console, "  a supervisor access to a user address - SMAP, or a stray user pointer");
+        }
     }
     if frame.vector == VECTOR_DOUBLE_FAULT {
         // A #DF only says "a fault happened while delivering a fault". CR2 still
@@ -169,6 +189,38 @@ fn report(console: &mut Console, frame: &TrapFrame, address: u64) {
     }
     let _ = writeln!(console, "  halting - this core cannot continue");
     console.set_alert(false);
+}
+
+/// Whether a fault looks like SMEP or SMAP rather than an ordinary permission
+/// error: a present page, a supervisor access, and a user-half address.
+fn smap_suspected(address: u64, cause: PageFaultCause) -> bool {
+    cause.protection_violation && !cause.user && address < USER_LIMIT
+}
+
+/// Arm the handler to survive one page fault at `address`.
+///
+/// Returns the slot the faulting code must write its resume address into. The
+/// two halves are separate because only the faulting code knows where its own
+/// instruction ends.
+#[must_use]
+pub fn arm_page_fault(address: u64) -> *mut u64 {
+    EXPECT_FAULT_AT.store(address, Ordering::SeqCst);
+    RESUME_AT.store(0, Ordering::SeqCst);
+    ARMED.store(true, Ordering::SeqCst);
+    RESUME_AT.as_ptr()
+}
+
+/// Disarm, whether or not the expected fault arrived.
+pub fn disarm() {
+    ARMED.store(false, Ordering::SeqCst);
+    RESUME_AT.store(0, Ordering::SeqCst);
+    EXPECT_FAULT_AT.store(0, Ordering::SeqCst);
+}
+
+/// Whether the armed fault has been consumed.
+#[must_use]
+pub fn fault_was_taken() -> bool {
+    !ARMED.load(Ordering::SeqCst)
 }
 
 /// Whether `address` lies in the boot stack's guard page.
@@ -205,11 +257,11 @@ pub fn selftest_recoverable(console: &mut Console) {
 
     let guard = &raw const __stack_guard as u64;
     let _ = writeln!(console, "trap self-test: reading the unmapped guard page at {guard:#x}");
-    EXPECT_FAULT_AT.store(guard, Ordering::SeqCst);
-    // SAFETY: the IDT is installed and `on_trap` resumes at `*RESUME_AT` for a
-    // page fault at exactly this address, which is what this is about to cause.
-    unsafe { selftest::read_unmapped(guard, RESUME_AT.as_ptr()) };
-    EXPECT_FAULT_AT.store(0, Ordering::SeqCst);
+    let slot = arm_page_fault(guard);
+    // SAFETY: the IDT is installed and `on_trap` resumes at `*slot` for a page
+    // fault at exactly this address, which is what this is about to cause.
+    unsafe { selftest::read_unmapped(guard, slot) };
+    disarm();
 
     let _ = writeln!(console, "trap self-test: both traps returned to their caller");
 }

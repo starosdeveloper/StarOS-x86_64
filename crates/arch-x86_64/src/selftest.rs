@@ -94,3 +94,30 @@ pub unsafe fn overflow_the_stack() -> ! {
         );
     }
 }
+
+/// Write `value` to `address`, and continue at the instruction after the store.
+///
+/// The counterpart of [`read_unmapped`] for the faults a *read* cannot provoke:
+/// a store to a read-only page, and a supervisor store to a user page with SMAP
+/// on. Whether the store actually happened is the caller's check, and it is the
+/// important one — a SMAP that is not enabled produces no fault and no message,
+/// just a successful write.
+///
+/// # Safety
+/// An IDT must be installed and its handler must resume at `*resume` when it
+/// sees a page fault at `address`. If the store does not fault, it takes effect.
+pub unsafe fn write_at(address: u64, value: u64, resume: *mut u64) {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        asm!(
+            "lea {tmp}, [rip + 2f]",
+            "mov qword ptr [{slot}], {tmp}",
+            "mov qword ptr [{addr}], {val}",
+            "2:",
+            tmp = out(reg) _,
+            slot = in(reg) resume,
+            addr = in(reg) address,
+            val = in(reg) value,
+        );
+    }
+}
