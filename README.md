@@ -35,6 +35,7 @@ cargo ktest-host    # the crates this tree owns (132 tests)
 ./scripts/mkesp.sh       # build both halves, stage an ESP layout
 ./scripts/run-qemu.sh    # boot it: OVMF -> BOOTX64.EFI -> kernel
 ./scripts/smoke-test.sh  # boot it and assert on the output (63 assertions)
+./scripts/boot-matrix.sh # boot it on six other machines (102 assertions)
 ```
 
 Shared crates are tested in `../kernel-new` (`cargo ktest-host` there), so their
@@ -136,6 +137,29 @@ that machine.
 ESP, a truncated image, no image at all — and checks each is refused by name and
 halts rather than falling through to the next boot option. A loader that has only
 ever seen a good kernel is a loader whose error paths have never run.
+
+`boot-matrix.sh` asks the other question: does it work on a machine that is not
+this one. Six more configurations, each chosen because it runs code the default
+QEMU machine never reaches — and each asserting on what should be *different*,
+not merely that the boot finished.
+
+| machine | what it is the only test of |
+|---|---|
+| `-cpu qemu64` | the 2 MiB page-table fallback, and the no-SMEP/SMAP branch |
+| `-m 128M` | a heap that is a visible fraction of the machine |
+| `-m 4G` | RAM either side of the PCI hole, so the extent of RAM is not the amount of it |
+| `-vga none` | no GOP at all: the console is serial only and every framebuffer path is absent |
+| `-smp 4` | three cores parked by firmware while the boot core rewrites `CR3` and `CR4` |
+| `-machine pc` | a different chipset, so the memory map is read rather than recognised |
+| `--release` | LTO and `opt-level = "z"` over naked functions, inline assembly and a linker script |
+
+The 4 GiB machine is the one that makes a current limitation visible, so the
+matrix asserts on it rather than letting it pass unnoticed: the frame pool is a
+single contiguous run, and the buddy allocator rounds that run down to a power of
+two. A 4 GiB guest reports 4042 MiB usable, splits it around the PCI hole so the
+largest run is 1956 MiB, and the allocator manages 1024 MiB of that — about a
+quarter of the machine. Not a bug, but not free either, and the line that has to
+change when one pool becomes several.
 
 [`docs/SPEC.md`](docs/SPEC.md) holds the contracts: boot hand-off, memory layout,
 interrupt model, syscall ABI, and every place x86 differs from aarch64 along with
