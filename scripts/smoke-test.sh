@@ -173,9 +173,33 @@ expect "$L" "timer interrupts delivered on the remapped vector and acknowledged"
 expect "$L" "interrupts masked again afterwards" 'irq: interrupts masked again'
 forbid "$L" "an interrupt on a line nothing asked for" 'on lines nothing asked for'
 
+# --- phase 2.2: the real controller ----------------------------------------
+# Everything the APICs need comes out of ACPI, and the kernel says which table it
+# read it from rather than recognising addresses.
+expect "$L" "the MADT was found and parsed" \
+    'acpi: madt at 0x[0-9a-f]+, [0-9]+ cpu\(s\), local apic at 0xfee00000'
+expect "$L" "the I/O APIC was located from the table" 'acpi: io apic at 0x[0-9a-f]+, first gsi [0-9]+'
+expect "$L" "the local APIC came up enabled" \
+    'lapic: id [0-9]+, version 0x[0-9a-f]+, [0-9]+ lvt entries, spurious vector 255, enabled'
+forbid "$L" "the local APIC did not enable"  'NOT ENABLED'
+expect "$L" "the I/O APIC reported its own size" \
+    'ioapic: id [0-9]+, version 0x[0-9a-f]+, [0-9]+ entries covering gsi'
+# The criterion for this phase, and the one thing that cannot be guessed: on this
+# machine the timer's IRQ 0 arrives as GSI *2*, because the 8259 cascade line took
+# GSI 0 first. Programming entry 0 configures a line nothing is attached to, and
+# the symptom is silence - no error, no fault, no ticks.
+expect "$L" "the GSI came from the MADT, not from the IRQ number" \
+    'ioapic: irq 0 arrives on gsi 2 \(remapped by the MADT'
+expect "$L" "the timer was routed to a vector above the 8259 range" \
+    'ioapic: gsi 2 -> vector 48 on apic [0-9]+'
+expect "$L" "interrupts arrived through the I/O APIC and were acknowledged at the local APIC" \
+    'irq: [0-9]+ timer interrupts delivered on vector 48 through the I/O APIC and acknowledged'
+forbid "$L" "a redirection entry did not read back" 'entry read back as'
+forbid "$L" "the local APIC raised a spurious interrupt" 'spurious from the local APIC'
+
 forbid "$L" "a self-test reported failure"   'SELF-TEST FAILED|did not converge|self-test FAILED'
 forbid "$L" "a phase was claimed after a failure" 'not claiming phase'
-expect "$L" "boot reached the end of phase 2.1" 'phase 2.1 complete'
+expect "$L" "boot reached the end of phase 2.2" 'phase 2.2 complete'
 
 # The last act: a deliberate stack overflow. Without a TSS, an IST and a #DF
 # gate this is a triple fault and the log simply stops - which is exactly what

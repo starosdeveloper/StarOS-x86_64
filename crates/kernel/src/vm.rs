@@ -48,6 +48,71 @@ use crate::mem;
 /// second, special-cased mapping for each of them.
 const MIN_LINEAR: u64 = 4 * SIZE_1G;
 
+/// Where device registers are mapped, one page at a time, as they are needed.
+///
+/// A window of its own rather than a hole punched in the linear map, and the
+/// reason is the granule. The linear map is built out of 1 GiB pages; making one
+/// 4 KiB page inside it uncacheable would mean splitting a gigabyte-wide entry
+/// into five hundred and twelve, or refusing the request — which is exactly what
+/// [`staros_paging::MapError::LargePageCollision`] does. A separate window costs
+/// one page table and asks no questions.
+///
+/// It sits above the linear map's reach and below the kernel image, in a part of
+/// the address space nothing else claims.
+const DEVICE_BASE: u64 = 0xFFFF_9000_0000_0000;
+
+/// How much of the device window is handed out. Bumped, never returned: the
+/// devices mapped here — the interrupt controllers, and later the HPET — live
+/// for as long as the kernel does.
+static DEVICE_NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Map `len` bytes of device registers at `phys` and return where they landed.
+///
+/// The mapping is uncacheable, and that is the whole point of the function
+/// existing rather than callers reaching through the linear map. A cached MMIO
+/// write can sit in a write-back line and reach the device late; a cached read
+/// can return a value the device has already changed. On most PCs the MTRRs
+/// firmware set already mark the APIC window uncacheable and a kernel that got
+/// this wrong would work anyway — which is precisely why it is worth saying in
+/// the page tables rather than depending on somebody else's configuration.
+///
+/// # Errors
+/// Propagates the mapper, and refuses a request that would run past the window.
+///
+/// # Safety
+/// `phys` must be device registers nothing else has mapped, and `tables` must be
+/// the live tree. Called on the boot core during bring-up.
+pub unsafe fn map_device(tables: &Tables, phys: u64, len: u64) -> Result<u64, &'static str> {
+    use core::sync::atomic::Ordering;
+
+    /// How much address space the window covers. Generous, and bounded so a
+    /// runaway caller collides with the check rather than with the kernel image.
+    const DEVICE_WINDOW: u64 = 1 << 30;
+
+    let offset = phys & (PAGE_SIZE - 1);
+    let base = phys - offset;
+    let span = (len + offset).next_multiple_of(PAGE_SIZE);
+
+    let at = DEVICE_NEXT.fetch_add(span, Ordering::SeqCst);
+    if at + span > DEVICE_WINDOW {
+        return Err("the device window is full");
+    }
+    let virt = DEVICE_BASE + at;
+
+    let mut frames = KernelFrames;
+    let mut mapper = Mapper::adopt(tables.root, &mut frames, tables.gib_pages);
+    mapper
+        .map_device(virt, base, span, Rights::RW)
+        .map_err(MapError::as_str)?;
+    for page in (0..span).step_by(PAGE_SIZE as usize) {
+        // The tree is live, and the CPU caches the *absence* of a translation as
+        // readily as a translation.
+        // SAFETY: ring 0; these addresses were just given mappings.
+        unsafe { cpu::invlpg(virt + page) };
+    }
+    Ok(virt + offset)
+}
+
 unsafe extern "C" {
     static __text_start: u8;
     static __text_end: u8;

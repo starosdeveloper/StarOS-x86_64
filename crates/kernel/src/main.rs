@@ -14,6 +14,7 @@
 #![no_std]
 #![no_main]
 
+mod acpi;
 mod console;
 mod heap;
 mod irq;
@@ -117,6 +118,21 @@ unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
         }
     }
 
+    // Take a copy, and use nothing but the copy from here on.
+    //
+    // `boot_info` is a *physical* address. It is dereferenceable right now only
+    // because the loader's identity map is still in force, and `vm::init` tears
+    // that map down — after which the same pointer reads an address nobody maps.
+    // The failure is not subtle when it happens, but it is invisible until
+    // something reads the hand-off late: everything up to phase 2.1 happened to
+    // read it before the switch, and the first field read afterwards was a page
+    // fault at a suspiciously low address.
+    //
+    // A `BootInfo` is `Copy` and small, so the copy lives in this frame, on the
+    // kernel's own stack, which is mapped in both trees. The memory map it points
+    // *at* is copied separately by `mem::init`, and for the same reason.
+    let info = *info;
+
     let _ = writeln!(
         console,
         "boot info accepted: {} memory regions, rsdp {:#x}, kernel {:#x}+{:#x}",
@@ -179,7 +195,7 @@ unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
     //
     // SAFETY: the hand-off has been validated above and nothing has allocated
     // yet, so the loader's memory-map buffer is still intact. Called once.
-    let layout = match unsafe { mem::init(info, boot_info as u64) } {
+    let layout = match unsafe { mem::init(&info, boot_info as u64) } {
         Ok(layout) => layout,
         Err(e) => {
             let _ = writeln!(console, "memory: {}", e.as_str());
@@ -255,16 +271,43 @@ unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
     // where it delivers is a question only a delivered interrupt can answer.
     ok &= irq::selftest(console);
 
+    // And the real controller. Everything the APICs need is in ACPI: where they
+    // are, how many cores there are, and — the fact that cannot be guessed —
+    // which global system interrupt a legacy IRQ actually arrives on.
+    //
+    // SAFETY: the linear map is live and `rsdp` comes from the validated hand-off.
+    match unsafe { acpi::discover(console, info.rsdp) } {
+        Some(facts) => {
+            facts.describe(console);
+            // SAFETY: boot core, called once, interrupts masked, tables live.
+            match unsafe { irq::init_apic(console, &tables, &facts) } {
+                // SAFETY: the APICs are up and interrupts are still masked.
+                Ok(()) => ok &= unsafe { irq::selftest_apic(console, &facts) },
+                Err(e) => {
+                    let _ = writeln!(console, "apic SELF-TEST FAILED: {e}");
+                    ok = false;
+                }
+            }
+        }
+        None => {
+            // Not fatal in principle — the 8259s work — but this kernel is not
+            // going to grow a legacy-only path, so saying so and stopping is
+            // more honest than carrying on with a controller that has no future.
+            let _ = writeln!(console, "acpi SELF-TEST FAILED: no usable MADT, cannot reach the APICs");
+            ok = false;
+        }
+    }
+
     // The completion line is a claim, so it is only made when it is true. A boot
     // that prints "complete" after a failed self-test is worse than one that
     // prints nothing: it is the line a later reader will trust.
     if !ok {
-        let _ = writeln!(console, "a self-test failed; not claiming phase 2.1. Halting.");
+        let _ = writeln!(console, "a self-test failed; not claiming phase 2.2. Halting.");
         cpu::halt()
     }
     let _ = writeln!(
         console,
-        "phase 2.1 complete: own memory, faults caught, device interrupts land where they should."
+        "phase 2.2 complete: interrupts routed by the APICs, on the vectors ACPI named."
     );
 
     // And one that does not come back. Last, deliberately: it is the only proof

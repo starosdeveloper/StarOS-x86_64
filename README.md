@@ -30,12 +30,12 @@ cargo kbuild        # kernel ELF   -> x86_64-unknown-none
 cargo kloader       # loader EFI   -> x86_64-unknown-uefi
 cargo kclippy       # clippy, kernel
 cargo kloader-clippy
-cargo ktest-host    # the crates this tree owns (132 tests)
+cargo ktest-host    # the crates this tree owns (149 tests)
 
 ./scripts/mkesp.sh       # build both halves, stage an ESP layout
 ./scripts/run-qemu.sh    # boot it: OVMF -> BOOTX64.EFI -> kernel
-./scripts/smoke-test.sh  # boot it and assert on the output (63 assertions)
-./scripts/boot-matrix.sh # boot it on six other machines (102 assertions)
+./scripts/smoke-test.sh  # boot it and assert on the output (73 assertions)
+./scripts/boot-matrix.sh # boot it on six other machines (123 assertions)
 ```
 
 Shared crates are tested in `../kernel-new` (`cargo ktest-host` there), so their
@@ -46,18 +46,18 @@ partition; `run-qemu.sh --debug` starts stopped with a gdb stub on `:1234`.
 
 ## Status
 
-**Phase 1 complete and phase 2.1 with it, verified on live firmware.** OVMF finds
-`EFI/BOOT/BOOTX64.EFI`; the loader collects the RSDP, the GOP framebuffer, the
-kernel and an optional initramfs off the ESP it was itself loaded from, places
+**Phase 1 complete, and phase 2 through 2.2, verified on live firmware.** OVMF
+finds `EFI/BOOT/BOOTX64.EFI`; the loader collects the RSDP, the GOP framebuffer,
+the kernel and an optional initramfs off the ESP it was itself loaded from, places
 the `PT_LOAD` segments with their own rights (W^X), builds identity, linear and
 kernel mappings, takes the memory map last, leaves boot services with the retry
 the specification requires, and jumps to `_start` with `BootInfo` in `RDI`. The
 kernel takes its own stack, validates the hand-off, mirrors every message to COM1
 and the screen, installs its own GDT, TSS and IDT, takes ownership of physical
 memory, builds its own page tables, moves the 8259s off the CPU's exception
-vectors and runs with interrupts enabled for the first time — and proves each of
-those by faulting on purpose, because a correct table and a subtly wrong one are
-both completely silent until something faults.
+vectors, reads the interrupt topology out of ACPI and brings up the APICs — and
+proves each of those by faulting or interrupting on purpose, because a correct
+table and a subtly wrong one are both completely silent until something happens.
 
 ```
 STAR OS microkernel (x86_64) v0.1.0
@@ -81,7 +81,14 @@ pic: 8259 pair remapped to vectors 32..48, masks 0xffff
 pit: channel 0 at 1000 Hz on IRQ 0, expecting vector 32
 irq: 8 timer interrupts delivered on vector 32 and acknowledged
 irq: interrupts masked again until the APIC is up
-phase 2.1 complete: own memory, faults caught, device interrupts land where they should.
+acpi: madt at 0x1fb78000, 1 cpu(s), local apic at 0xfee00000, legacy pics present
+acpi: io apic at 0xfec00000, first gsi 0
+lapic: id 0, version 0x14, 6 lvt entries, spurious vector 255, enabled
+ioapic: id 0, version 0x20, 24 entries covering gsi 0..24
+ioapic: irq 0 arrives on gsi 2 (remapped by the MADT - assuming identity would route the wrong line)
+ioapic: gsi 2 -> vector 48 on apic 0, pit at 1000 Hz
+irq: 8 timer interrupts delivered on vector 48 through the I/O APIC and acknowledged at the local APIC
+phase 2.2 complete: interrupts routed by the APICs, on the vectors ACPI named.
 
 KERNEL FAULT: vector 8 - #DF double fault
   the first fault was at 0xffffffff80043f68
@@ -110,6 +117,30 @@ acknowledgement: without an EOI the line stays in service and the second never
 comes. Skip the remap and that same tick arrives as vector 0, ending the boot in
 `KERNEL FAULT: vector 0 - #DE divide error` — a division that never happened,
 which is exactly the class of lie the remap exists to prevent.
+
+The second set of ticks proves something different: that the route was *read*
+rather than guessed. The I/O APIC has one redirection entry per **global system
+interrupt**, and legacy IRQ numbers map onto GSIs by a table the firmware
+publishes — not by identity. On this machine the timer's IRQ 0 arrives as GSI 2,
+because the 8259 cascade line took GSI 0 first. Program entry 0 and the line is
+configured perfectly for something that is not attached to it: no error, no fault,
+no ticks. The entry is also read back after writing, because these are indirect
+registers — an index to one port, a value to another — and a driver with the
+sequence wrong writes somewhere plausible and reports nothing.
+
+That phase is also where the shared HAL's interrupt trait had to be reshaped, which
+is the whole reason a second architecture exists in this repository.
+`acknowledge()` used to be one of its four methods: on a GIC it both identifies the
+pending interrupt and takes it, because the handler asks `GICC_IAR` and the register
+answers with an id. There is no such register on x86 and no such question — the I/O
+APIC was told in advance which vector the line becomes, so by the time the handler
+runs the CPU has already answered by choosing an IDT entry. A method whose purpose
+is to ask cannot be implemented by a controller that was told, so it moved into
+`AcknowledgingController`, which the GIC implements and the APIC does not.
+`end_of_interrupt` kept its argument and gained a paragraph saying it is advisory:
+the local APIC's EOI register accepts only zero, the GIC's needs the id, and an
+implementation that ignores an argument loses nothing while one that needs a
+missing argument is broken.
 
 The page tables themselves are not checked by booting. `staros-paging` abstracts
 the two things the loader and the kernel do differently — where a table frame

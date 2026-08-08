@@ -21,6 +21,10 @@
 //!   before any interrupt can be enabled.
 //! - [`pit`] — the 8254, in the smallest form that can raise one real hardware
 //!   interrupt on demand.
+//! - [`mmio`] — memory-mapped registers, as a trait, for the same reason
+//!   [`port`] is one.
+//! - [`apic`] — the local APIC and the I/O APIC: the controller that replaces
+//!   the 8259s, and the place the HAL's interrupt trait had to be reshaped.
 //! - [`selftest`] — faults taken on purpose, because a correct IDT and a subtly
 //!   wrong one are both silent until something faults.
 //!
@@ -46,9 +50,11 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod apic;
 pub mod cpu;
 pub mod gdt;
 pub mod idt;
+pub mod mmio;
 pub mod pic;
 pub mod pit;
 pub mod port;

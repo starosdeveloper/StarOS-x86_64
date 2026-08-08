@@ -116,7 +116,13 @@ reached_the_end() {
     expect "$log" "own tables loaded"          'vm: cr3 0x[0-9a-f]+'
     expect "$log" "the frame pool converged"   'frames: [0-9]+ rounds of up to [0-9]+ allocations converged'
     expect "$log" "timer interrupts arrived"   'irq: [0-9]+ timer interrupts delivered on vector 32'
-    expect "$log" "the boot claimed the phase" 'phase 2.1 complete'
+    # And again through the APICs, on a route read out of the MADT rather than
+    # assumed. The GSI is not asserted here - it is a property of the machine, and
+    # the machines below differ.
+    expect "$log" "the MADT was read"          'acpi: madt at 0x[0-9a-f]+'
+    expect "$log" "the local APIC came up"     'lapic: id [0-9]+, .*enabled'
+    expect "$log" "the APIC route was taken"   'irq: [0-9]+ timer interrupts delivered on vector 48 through the I/O APIC'
+    expect "$log" "the boot claimed the phase" 'phase 2.2 complete'
     forbid "$log" "a self-test failed"         'SELF-TEST FAILED|not claiming phase'
     forbid "$log" "the loader gave up"         'BOOT FAILED'
     forbid "$log" "a panic"                    'KERNEL PANIC'

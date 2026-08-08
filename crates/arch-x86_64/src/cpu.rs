@@ -213,3 +213,36 @@ pub unsafe fn invlpg(virt: u64) {
     // uses the address to select a TLB entry.
     unsafe { asm!("invlpg [{}]", in(reg) virt, options(nostack, preserves_flags)) };
 }
+
+/// Read a model-specific register.
+///
+/// The value arrives in two halves, `EDX:EAX`, which is why this is not simply a
+/// 64-bit move: the instruction predates 64-bit registers and kept its shape.
+///
+/// # Safety
+/// `msr` must exist on this CPU. Reading one that does not raises `#GP`, which
+/// during bring-up is a fault report and after it is a dead core.
+#[must_use]
+pub unsafe fn read_msr(msr: u32) -> u64 {
+    let (low, high): (u32, u32);
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        asm!("rdmsr", in("ecx") msr, out("eax") low, out("edx") high,
+             options(nomem, nostack, preserves_flags));
+    }
+    (u64::from(high) << 32) | u64::from(low)
+}
+
+/// Write a model-specific register.
+///
+/// # Safety
+/// `msr` must exist and `value` must be legal for it. These registers control
+/// paging modes, the syscall entry point and the local APIC's base address;
+/// a wrong value is not a fault so much as a different machine.
+pub unsafe fn write_msr(msr: u32, value: u64) {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        asm!("wrmsr", in("ecx") msr, in("eax") value as u32, in("edx") (value >> 32) as u32,
+             options(nomem, nostack, preserves_flags));
+    }
+}

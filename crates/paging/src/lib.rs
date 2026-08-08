@@ -42,6 +42,10 @@ pub const PTE_PRESENT: u64 = 1 << 0;
 pub const PTE_WRITE: u64 = 1 << 1;
 /// Accessible from ring 3.
 pub const PTE_USER: u64 = 1 << 2;
+/// Write-through rather than write-back.
+pub const PTE_PWT: u64 = 1 << 3;
+/// Cache disable.
+pub const PTE_PCD: u64 = 1 << 4;
 /// Page size: this entry maps a large page rather than pointing at a table.
 pub const PTE_HUGE: u64 = 1 << 7;
 /// No-execute. Only means that with `EFER.NXE` set; otherwise it is a *reserved*
@@ -129,6 +133,48 @@ impl Rights {
     }
 }
 
+/// How the CPU may cache what a mapping covers.
+///
+/// Ordinary RAM is cached; device registers must not be. The distinction is not
+/// an optimisation — a cached MMIO write can sit in a write-back line and reach
+/// the device late or not at all, and a cached read can return a value the
+/// device no longer holds. An interrupt controller programmed through cached
+/// mappings works right up until the cache decides otherwise.
+///
+/// On x86 this is *usually* invisible, which is what makes it dangerous: the MTRRs
+/// firmware sets already mark the APIC window uncacheable, so a kernel that never
+/// sets these bits works on most machines and fails on the one whose firmware
+/// did not bother. Saying it in the page tables costs two bits and removes the
+/// dependency on somebody else's configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemoryType {
+    /// Write-back cached. RAM.
+    Normal,
+    /// Uncached and write-through. Device registers.
+    Device,
+}
+
+impl MemoryType {
+    /// The cache-control bits a leaf entry carries.
+    #[must_use]
+    pub const fn leaf_bits(self) -> u64 {
+        match self {
+            Self::Normal => 0,
+            Self::Device => PTE_PCD | PTE_PWT,
+        }
+    }
+
+    /// Read the type back out of an entry.
+    #[must_use]
+    pub const fn from_bits(bits: u64) -> Self {
+        if bits & PTE_PCD != 0 {
+            Self::Device
+        } else {
+            Self::Normal
+        }
+    }
+}
+
 /// Why a mapping could not be made.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MapError {
@@ -185,6 +231,12 @@ pub struct Translation {
     pub phys: u64,
     /// The rights **as the walk computes them**, not the leaf's own.
     pub rights: Rights,
+    /// Whether the leaf says this may be cached.
+    ///
+    /// From the leaf alone, unlike the rights: the cache-control bits do not
+    /// combine along the walk the way permissions do — the CPU takes them from
+    /// the entry that maps the page.
+    pub memory_type: MemoryType,
     /// The size of the page that covers it: 4 KiB, 2 MiB or 1 GiB.
     pub page_size: u64,
 }
@@ -238,6 +290,40 @@ impl<'a, F: FrameSource> Mapper<'a, F> {
     /// # Errors
     /// See [`MapError`].
     pub fn map(&mut self, virt: u64, phys: u64, size: u64, rights: Rights) -> Result<(), MapError> {
+        self.map_as(virt, phys, size, rights, MemoryType::Normal)
+    }
+
+    /// Map device registers: the same walk, with the leaves marked uncacheable.
+    ///
+    /// Separate from [`Mapper::map`] rather than a flag on [`Rights`], because
+    /// this is not a permission. Rights say who may touch the memory; this says
+    /// what the CPU may do with the value afterwards, and the two combine in
+    /// different ways — permissions along the walk, cacheability at the leaf.
+    ///
+    /// # Errors
+    /// See [`MapError`].
+    pub fn map_device(
+        &mut self,
+        virt: u64,
+        phys: u64,
+        size: u64,
+        rights: Rights,
+    ) -> Result<(), MapError> {
+        self.map_as(virt, phys, size, rights, MemoryType::Device)
+    }
+
+    /// The walk both of the above share.
+    ///
+    /// # Errors
+    /// See [`MapError`].
+    pub fn map_as(
+        &mut self,
+        virt: u64,
+        phys: u64,
+        size: u64,
+        rights: Rights,
+        memory_type: MemoryType,
+    ) -> Result<(), MapError> {
         if !virt.is_multiple_of(PAGE_SIZE)
             || !phys.is_multiple_of(PAGE_SIZE)
             || !size.is_multiple_of(PAGE_SIZE)
@@ -249,13 +335,13 @@ impl<'a, F: FrameSource> Mapper<'a, F> {
         while done < size {
             let (v, p, left) = (virt + done, phys + done, size - done);
             let step = if self.gib_pages && fits(v, p, left, SIZE_1G) {
-                self.map_leaf(v, p, rights, 2)?;
+                self.map_leaf(v, p, rights, memory_type, 2)?;
                 SIZE_1G
             } else if fits(v, p, left, SIZE_2M) {
-                self.map_leaf(v, p, rights, 1)?;
+                self.map_leaf(v, p, rights, memory_type, 1)?;
                 SIZE_2M
             } else {
-                self.map_leaf(v, p, rights, 0)?;
+                self.map_leaf(v, p, rights, memory_type, 0)?;
                 PAGE_SIZE
             };
             done += step;
@@ -284,6 +370,7 @@ impl<'a, F: FrameSource> Mapper<'a, F> {
                 return Some(Translation {
                     phys: base + (virt & (page_size - 1)),
                     rights: effective,
+                    memory_type: MemoryType::from_bits(entry),
                     page_size,
                 });
             }
@@ -317,7 +404,20 @@ impl<'a, F: FrameSource> Mapper<'a, F> {
     }
 
     /// Install one leaf entry at `level` (0 = 4 KiB, 1 = 2 MiB, 2 = 1 GiB).
-    fn map_leaf(&mut self, virt: u64, phys: u64, rights: Rights, level: u32) -> Result<(), MapError> {
+    ///
+    /// The cache bits go on the leaf and nowhere else. On an intermediate entry
+    /// `PCD` and `PWT` describe how the CPU may cache *the table it points at*,
+    /// not the pages below it — setting them there would make the page walk
+    /// uncached and every mapping under it slow, while leaving the device
+    /// mapping itself write-back.
+    fn map_leaf(
+        &mut self,
+        virt: u64,
+        phys: u64,
+        rights: Rights,
+        memory_type: MemoryType,
+        level: u32,
+    ) -> Result<(), MapError> {
         let mut table = self.root;
         let mut walk = 3u32;
         while walk > level {
@@ -325,7 +425,8 @@ impl<'a, F: FrameSource> Mapper<'a, F> {
             walk -= 1;
         }
         let huge = if level > 0 { PTE_HUGE } else { 0 };
-        self.write(table, index(virt, level), phys | rights.leaf_bits() | huge);
+        let bits = phys | rights.leaf_bits() | memory_type.leaf_bits() | huge;
+        self.write(table, index(virt, level), bits);
         Ok(())
     }
 
@@ -612,6 +713,61 @@ mod tests {
         assert_eq!(m.unmap(LINEAR + 0x1234).unwrap().page_size, SIZE_1G);
         assert!(m.translate(LINEAR).is_none());
         assert!(m.translate(LINEAR + SIZE_1G - PAGE_SIZE).is_none());
+    }
+
+    #[test]
+    fn device_mappings_are_uncached_and_ram_is_not() {
+        let mut mem = FakeMemory::new();
+        let mut m = Mapper::new(&mut mem, false).unwrap();
+        m.map(LINEAR, 0, PAGE_SIZE, Rights::RW).unwrap();
+        m.map_device(LINEAR + PAGE_SIZE, 0xFEE0_0000, PAGE_SIZE, Rights::RW).unwrap();
+
+        assert_eq!(m.translate(LINEAR).unwrap().memory_type, MemoryType::Normal);
+        let dev = m.translate(LINEAR + PAGE_SIZE).unwrap();
+        assert_eq!(dev.memory_type, MemoryType::Device);
+        assert_eq!(dev.phys, 0xFEE0_0000);
+        // Rights are unaffected: this is not a permission.
+        assert_eq!(dev.rights, Rights::RW);
+    }
+
+    #[test]
+    fn the_cache_bits_are_the_two_the_architecture_names() {
+        assert_eq!(MemoryType::Normal.leaf_bits(), 0);
+        assert_eq!(MemoryType::Device.leaf_bits(), PTE_PCD | PTE_PWT);
+        assert_eq!(PTE_PWT, 1 << 3);
+        assert_eq!(PTE_PCD, 1 << 4);
+        // And they must not collide with anything else a leaf carries. PWT and
+        // PCD sit between the user bit and the accessed bit, which is exactly
+        // the sort of neighbourhood an off-by-one lands in.
+        for r in [Rights::RO, Rights::RW, Rights::RX, Rights::RW.to_user()] {
+            assert_eq!(r.leaf_bits() & (PTE_PCD | PTE_PWT), 0);
+        }
+    }
+
+    #[test]
+    fn cacheability_comes_from_the_leaf_not_the_walk() {
+        // Unlike permissions. A device page and a RAM page can share every table
+        // above them, and each must keep its own answer - if the bits were
+        // combined along the walk the way rights are, one would take the other's.
+        let mut mem = FakeMemory::new();
+        let mut m = Mapper::new(&mut mem, false).unwrap();
+        m.map_device(LINEAR, 0xFEC0_0000, PAGE_SIZE, Rights::RW).unwrap();
+        m.map(LINEAR + PAGE_SIZE, 0x1000, PAGE_SIZE, Rights::RW).unwrap();
+
+        assert_eq!(m.translate(LINEAR).unwrap().memory_type, MemoryType::Device);
+        assert_eq!(m.translate(LINEAR + PAGE_SIZE).unwrap().memory_type, MemoryType::Normal);
+    }
+
+    #[test]
+    fn a_device_mapping_can_use_a_large_page() {
+        // Some device windows are megabytes wide, and the leaf that carries the
+        // cache bits is then a PD entry rather than a PT entry.
+        let mut mem = FakeMemory::new();
+        let mut m = Mapper::new(&mut mem, false).unwrap();
+        m.map_device(LINEAR, 0xE000_0000, SIZE_2M, Rights::RW).unwrap();
+        let t = m.translate(LINEAR + 0x1000).unwrap();
+        assert_eq!(t.page_size, SIZE_2M);
+        assert_eq!(t.memory_type, MemoryType::Device);
     }
 
     #[test]
