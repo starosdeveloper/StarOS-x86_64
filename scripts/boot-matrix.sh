@@ -122,7 +122,15 @@ reached_the_end() {
     expect "$log" "the MADT was read"          'acpi: madt at 0x[0-9a-f]+'
     expect "$log" "the local APIC came up"     'lapic: id [0-9]+, .*enabled'
     expect "$log" "the APIC route was taken"   'irq: [0-9]+ timer interrupts delivered on vector 48 through the I/O APIC'
-    expect "$log" "the boot claimed the phase" 'phase 2.2 complete'
+    # The clock, measured against the HPET rather than assumed. The APIC timer's
+    # rate is a property of the machine, so it is not asserted - what is asserted
+    # is that a hundred ticks at a hundred hertz take a second, whatever that rate
+    # turns out to be.
+    expect "$log" "the HPET decoded"           'hpet: [0-9]+ Hz \([0-9]+ fs per tick\)'
+    expect "$log" "the APIC timer was calibrated" 'lapic timer: [0-9]+ ticks/s at divisor 16'
+    expect "$log" "a second measured as a second" \
+        'timer: 100 interrupts at 100 Hz took (0\.9[89][0-9]|1\.0[01][0-9]) s by the HPET'
+    expect "$log" "the boot claimed the phase" 'phase 2.3 complete'
     forbid "$log" "a self-test failed"         'SELF-TEST FAILED|not claiming phase'
     forbid "$log" "the loader gave up"         'BOOT FAILED'
     forbid "$log" "a panic"                    'KERNEL PANIC'

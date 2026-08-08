@@ -295,7 +295,24 @@ unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
             // SAFETY: boot core, called once, interrupts masked, tables live.
             match unsafe { irq::init_apic(console, &tables, &facts) } {
                 // SAFETY: the APICs are up and interrupts are still masked.
-                Ok(()) => ok &= unsafe { irq::selftest_apic(console, &facts) },
+                Ok(()) => {
+                    // SAFETY: the APICs are up and interrupts are still masked.
+                    ok &= unsafe { irq::selftest_apic(console, &facts) };
+
+                    // And a clock. Until now the only measure of time in this
+                    // kernel has been a spin count, which had to be guessed and
+                    // was guessed wrong once already.
+                    //
+                    // SAFETY: the APICs are up, interrupts are masked, tables live.
+                    match unsafe { irq::init_timer(console, &tables, &facts) } {
+                        // SAFETY: the timer is calibrated and stopped.
+                        Ok(rate) => ok &= unsafe { irq::selftest_timer(console, rate) },
+                        Err(e) => {
+                            let _ = writeln!(console, "timer SELF-TEST FAILED: {e}");
+                            ok = false;
+                        }
+                    }
+                }
                 Err(e) => {
                     let _ = writeln!(console, "apic SELF-TEST FAILED: {e}");
                     ok = false;
@@ -315,12 +332,12 @@ unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
     // that prints "complete" after a failed self-test is worse than one that
     // prints nothing: it is the line a later reader will trust.
     if !ok {
-        let _ = writeln!(console, "a self-test failed; not claiming phase 2.2. Halting.");
+        let _ = writeln!(console, "a self-test failed; not claiming phase 2.3. Halting.");
         cpu::halt()
     }
     let _ = writeln!(
         console,
-        "phase 2.2 complete: interrupts routed by the APICs, on the vectors ACPI named."
+        "phase 2.3 complete: the kernel has a clock, and knows how fast it runs."
     );
 
     // And one that does not come back. Last, deliberately: it is the only proof

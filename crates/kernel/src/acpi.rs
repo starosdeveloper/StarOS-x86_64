@@ -47,6 +47,12 @@ pub struct Facts {
     pub has_legacy_pics: bool,
     /// How many CPUs the firmware says are startable.
     pub cpus: usize,
+    /// Physical address of the first HPET block, if the machine has one.
+    ///
+    /// Optional in a way the APICs are not: a machine without an HPET is
+    /// unusual but legal, and the consequence is only that the APIC timer has
+    /// nothing to be calibrated against.
+    pub hpet: Option<u64>,
     /// Physical address of the MADT, so [`gsi_for_irq`] can go back to it.
     madt: u64,
 }
@@ -140,6 +146,13 @@ pub unsafe fn discover(console: &mut Console, rsdp_phys: u64) -> Option<Facts> {
     let mut ids = [0u32; 64];
     let cpus = madt.cpus(&mut ids);
 
+    // Absent on a machine with no HPET, which is legal and only costs the APIC
+    // timer its ruler.
+    // SAFETY: forwarded.
+    let hpet = unsafe { find_table(rsdp_phys, b"HPET") }
+        .and_then(staros_acpi::Hpet::parse)
+        .map(|h| h.address);
+
     let facts = Facts {
         local_apic: u64::from(madt.local_apic_address),
         io_apic: madt
@@ -147,6 +160,7 @@ pub unsafe fn discover(console: &mut Console, rsdp_phys: u64) -> Option<Facts> {
             .map(|(address, gsi_base)| (u64::from(address), gsi_base)),
         has_legacy_pics: madt.has_legacy_pics,
         cpus,
+        hpet,
         madt: (madt_bytes.as_ptr() as u64).wrapping_sub(staros_bootinfo::PHYS_MAP_BASE),
     };
     Some(facts)
@@ -217,6 +231,14 @@ impl Facts {
             }
             None => {
                 let _ = writeln!(console, "acpi: no I/O APIC in the MADT");
+            }
+        }
+        match self.hpet {
+            Some(address) => {
+                let _ = writeln!(console, "acpi: hpet at {address:#x}");
+            }
+            None => {
+                let _ = writeln!(console, "acpi: no HPET - the APIC timer has nothing to calibrate against");
             }
         }
     }

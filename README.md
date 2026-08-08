@@ -30,12 +30,12 @@ cargo kbuild        # kernel ELF   -> x86_64-unknown-none
 cargo kloader       # loader EFI   -> x86_64-unknown-uefi
 cargo kclippy       # clippy, kernel
 cargo kloader-clippy
-cargo ktest-host    # the crates this tree owns (157 tests)
+cargo ktest-host    # the crates this tree owns (173 tests)
 
 ./scripts/mkesp.sh       # build both halves, stage an ESP layout
 ./scripts/run-qemu.sh    # boot it: OVMF -> BOOTX64.EFI -> kernel
-./scripts/smoke-test.sh  # boot it and assert on the output (75 assertions)
-./scripts/boot-matrix.sh # boot it on six other machines (126 assertions)
+./scripts/smoke-test.sh  # boot it and assert on the output (79 assertions)
+./scripts/boot-matrix.sh # boot it on six other machines (147 assertions)
 ```
 
 Shared crates are tested in `../kernel-new` (`cargo ktest-host` there), so their
@@ -46,7 +46,7 @@ partition; `run-qemu.sh --debug` starts stopped with a gdb stub on `:1234`.
 
 ## Status
 
-**Phase 1 complete, and phase 2 through 2.2, verified on live firmware.** OVMF
+**Phase 1 complete, and phase 2 through 2.3, verified on live firmware.** OVMF
 finds `EFI/BOOT/BOOTX64.EFI`; the loader collects the RSDP, the GOP framebuffer,
 the kernel and an optional initramfs off the ESP it was itself loaded from, places
 the `PT_LOAD` segments with their own rights (W^X), builds identity, linear and
@@ -55,9 +55,10 @@ the specification requires, and jumps to `_start` with `BootInfo` in `RDI`. The
 kernel takes its own stack, validates the hand-off, mirrors every message to COM1
 and the screen, installs its own GDT, TSS and IDT, takes ownership of physical
 memory, builds its own page tables, moves the 8259s off the CPU's exception
-vectors, reads the interrupt topology out of ACPI and brings up the APICs — and
-proves each of those by faulting or interrupting on purpose, because a correct
-table and a subtly wrong one are both completely silent until something happens.
+vectors, reads the interrupt topology out of ACPI, brings up the APICs, and
+calibrates its own timer against the HPET — and proves each of those by faulting,
+interrupting or measuring on purpose, because a correct table and a subtly wrong
+one are both completely silent until something happens.
 
 ```
 STAR OS microkernel (x86_64) v0.1.0
@@ -70,7 +71,7 @@ trap: #BP at RIP=0xffffffff80017311, resuming
 trap: #PF at 0xffffffff80043000, err=0x0 (read from an unmapped page), resuming
 memory: 13059 MiB described, 458 MiB usable, RAM tops out at 0x20000000
 memory: device apertures reach 0x10000000000; the linear map stops at RAM
-memory: heap 1536 KiB at 0x1780000, pool 422 MiB at 0x1900000 (65536 frames managed)
+memory: heap 1940 KiB at 0x1780000, pool 455 MiB over 11 run(s) in 39 tree(s), 116647 frames managed
 vm: verified - text 0xffffffff800069a0 r-x, rodata r--, data rw-, 0x0 and the guard page absent
 vm: cr3 0x1900000, linear 4 GiB (1 GiB pages), smep on, smap on
 trap: #PF at 0x0, RIP=0xffffffff800172b8, err=0x0 (read from an unmapped page)
@@ -83,12 +84,17 @@ irq: 8 timer interrupts delivered on vector 32 and acknowledged
 irq: interrupts masked again until the APIC is up
 acpi: madt at 0x1fb78000, 1 cpu(s), local apic at 0xfee00000, legacy pics present
 acpi: io apic at 0xfec00000, first gsi 0
+acpi: hpet at 0xfed00000
 lapic: id 0, version 0x14, 6 lvt entries, spurious vector 255, enabled
 ioapic: id 0, version 0x20, 24 entries covering gsi 0..24
 ioapic: irq 0 arrives on gsi 2 (remapped by the MADT - assuming identity would route the wrong line)
 ioapic: gsi 2 -> vector 48 on apic 0, pit at 1000 Hz
 irq: 8 timer interrupts delivered on vector 48 through the I/O APIC and acknowledged at the local APIC
-phase 2.2 complete: interrupts routed by the APICs, on the vectors ACPI named.
+hpet: 100000000 Hz (10000000 fs per tick), 3 comparators, 64-bit counter, vendor 0x8086
+lapic timer: 62483087 ticks/s at divisor 16, measured over 20 ms of HPET
+lapic timer: periodic, 624830 ticks per interrupt on vector 49 (100 Hz nominal)
+timer: 100 interrupts at 100 Hz took 1.000 s by the HPET (0.0% off, tolerance 2%)
+phase 2.3 complete: the kernel has a clock, and knows how fast it runs.
 
 KERNEL FAULT: vector 8 - #DF double fault
   the first fault was at 0xffffffff80043f68
@@ -141,6 +147,22 @@ is to ask cannot be implemented by a controller that was told, so it moved into
 the local APIC's EOI register accepts only zero, the GIC's needs the id, and an
 implementation that ignores an argument loses nothing while one that needs a
 missing argument is broken.
+
+The last line of that block is a different kind of check again. Every clock on
+this machine has to be measured before it can be trusted — the APIC timer counts
+at the bus frequency, which varies by machine and by power state and is written
+down nowhere. The HPET is the exception: its capability register states the period
+of one tick in femtoseconds, so it needs no calibration and everything else is cut
+against it. A hundred ticks at a hundred hertz must then take a second, to within
+two per cent, timed by the clock that was not involved in producing them.
+
+That tolerance is what makes it a test rather than a presence check. A calibration
+that read the wrong register, or divided in the wrong direction, or used the
+APIC's divide encoding as though it were a logarithm — it is not; bit 2 is
+reserved and divide-by-one sits *past* the whole range — still produces a timer
+that ticks perfectly steadily, forever, at the wrong rate. Only a second clock can
+tell. Making `ticks_to_ns` divide by a thousand instead of a million reports the
+error as 6036%, and the boot declines to claim the phase.
 
 The page tables themselves are not checked by booting. `staros-paging` abstracts
 the two things the loader and the kernel do differently — where a table frame

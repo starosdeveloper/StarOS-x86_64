@@ -42,6 +42,7 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 use staros_arch_x86_64::apic::{self, IoApic, LocalApic, Redirection};
+use staros_arch_x86_64::hpet::Hpet;
 use staros_arch_x86_64::mmio::MappedRegisters;
 use staros_arch_x86_64::pic::{self, Pic8259};
 use staros_arch_x86_64::pit::Pit;
@@ -97,6 +98,37 @@ const SELFTEST_PATIENCE: u64 = 20_000_000;
 /// device interrupt.
 pub const APIC_TIMER_VECTOR: u8 = 48;
 
+/// Vector the local APIC's own timer arrives on.
+///
+/// Distinct from [`APIC_TIMER_VECTOR`], which is where the *8254's* line lands
+/// after the I/O APIC routes it. Two different devices and two different paths
+/// through the interrupt hardware; giving them one vector would make the boot log
+/// unable to tell which of them was working.
+pub const LAPIC_TIMER_VECTOR: u8 = 49;
+
+/// The rate the kernel's timer runs at.
+///
+/// 100 Hz, the rate the phase-2.3 criterion names. Low for a scheduler and right
+/// for a measurement: at 100 Hz a hundred ticks are a second, which is long
+/// enough that a 2% error is a real error rather than a rounding artefact.
+pub const TIMER_HZ: u32 = 100;
+
+/// Divisor applied to the local APIC's timer input.
+///
+/// 16 is a compromise between the two ways this goes wrong. Too small and a
+/// 32-bit count overflows: an undivided bus clock on a fast machine can exceed
+/// four billion ticks a second, so a one-second period does not fit. Too large
+/// and the calibration loses resolution, because a short measuring window then
+/// spans only a few hundred counts.
+pub const TIMER_DIVISOR: u32 = 16;
+
+/// How long the calibration window is.
+///
+/// The APIC timer is measured against the HPET over this interval. Twenty
+/// milliseconds is long enough that the fixed cost of reading two clocks is
+/// noise, and short enough not to be felt in a boot.
+const CALIBRATION_NS: u64 = 20_000_000;
+
 /// Vector the local APIC raises when an interrupt is withdrawn between the
 /// request and the acknowledge.
 ///
@@ -118,6 +150,9 @@ static LAPIC: SpinLock<Option<LocalApic<MappedRegisters>>> = SpinLock::new(None)
 
 /// The first I/O APIC, once its registers have been mapped.
 static IOAPIC: SpinLock<Option<IoApic<MappedRegisters>>> = SpinLock::new(None);
+
+/// The HPET, once its registers have been mapped.
+static HPET: SpinLock<Option<Hpet<MappedRegisters>>> = SpinLock::new(None);
 
 /// Which controller is delivering: the 8259s until the APICs are up.
 ///
@@ -540,4 +575,234 @@ pub unsafe fn selftest_apic(console: &mut Console, facts: &Facts) -> bool {
     }
     let _ = writeln!(console, "irq: interrupts masked again until there is a timer");
     passed
+}
+
+/// Bring up the HPET and calibrate the local APIC's timer against it.
+///
+/// The APIC timer counts at the bus frequency divided by [`TIMER_DIVISOR`], and
+/// that frequency is written down nowhere: it varies by machine, by chipset and
+/// by power state. So it is measured. The HPET's capability register states its
+/// own period in femtoseconds, which makes it the one clock on the machine that
+/// needs no calibration and therefore the one everything else is measured with.
+///
+/// The measurement is deliberately dull: start the APIC timer counting down from
+/// its maximum with the interrupt **masked**, spin on the HPET for a known
+/// interval, then read how far the APIC timer got. No interrupts are involved,
+/// which matters — calibration happens before there is anything for a timer
+/// interrupt to do.
+///
+/// # Errors
+/// Returns a message when there is no HPET, its registers do not decode, or the
+/// measurement comes out impossible. All three mean the kernel does not know how
+/// fast its own timer runs, and guessing is what this phase exists to stop.
+///
+/// # Safety
+/// Called once, after [`init_apic`], on the boot core with interrupts masked.
+pub unsafe fn init_timer(
+    console: &mut Console,
+    tables: &Tables,
+    facts: &Facts,
+) -> Result<u64, &'static str> {
+    let Some(hpet_phys) = facts.hpet else {
+        return Err("the machine declares no HPET");
+    };
+    // SAFETY: the address came from the HPET table, nothing else has mapped it,
+    // and `map_device` makes the mapping uncacheable.
+    let hpet_virt = unsafe { crate::vm::map_device(tables, hpet_phys, 0x400)? };
+    // SAFETY: `hpet_virt` is the live device mapping just made; single driver.
+    let mut hpet = Hpet::new(unsafe { MappedRegisters::new(hpet_virt) })
+        .ok_or("the HPET's capability register did not decode")?;
+    let caps = hpet.capabilities();
+    hpet.start();
+
+    let _ = writeln!(
+        console,
+        "hpet: {} Hz ({} fs per tick), {} comparators, {}-bit counter, vendor {:#06x}",
+        caps.frequency_hz(),
+        caps.period_fs,
+        caps.timers,
+        if caps.counter_64bit { 64 } else { 32 },
+        caps.vendor,
+    );
+    if !hpet.is_running() {
+        return Err("the HPET counter did not start");
+    }
+    // A clock that does not move is worse than no clock: every interval measured
+    // against it is zero, and every rate computed from it is infinite.
+    let first = hpet.now();
+    hpet.spin_ns(1_000);
+    let second = hpet.now();
+    if hpet.elapsed(first, second) == 0 {
+        return Err("the HPET counter is not advancing");
+    }
+
+    let ticks_per_second = {
+        let mut slot = LAPIC.lock();
+        let lapic = slot.as_mut().ok_or("the local APIC is not up")?;
+        if !lapic.set_timer_divisor(TIMER_DIVISOR) {
+            return Err("the local APIC cannot divide its timer by that");
+        }
+
+        // Count down from the top. The window is far shorter than the time this
+        // takes to reach zero, so the count is still running when it is read.
+        lapic.start_timer_masked(u32::MAX);
+        let hpet_start = hpet.now();
+        hpet.spin_ns(CALIBRATION_NS);
+        let apic_left = lapic.timer_count();
+        let hpet_end = hpet.now();
+        lapic.stop_timer();
+
+        let apic_elapsed = u64::from(u32::MAX - apic_left);
+        let hpet_elapsed_ns = hpet.elapsed_ns(hpet_start, hpet_end);
+        if apic_elapsed == 0 {
+            return Err("the local APIC's timer did not count");
+        }
+        if hpet_elapsed_ns == 0 {
+            return Err("no time passed during calibration");
+        }
+        // Ticks per second at the divisor that was set, which is the same divisor
+        // the periodic reload will use — so the two are consistent and the
+        // divisor itself never enters the arithmetic.
+        (apic_elapsed as u128 * 1_000_000_000 / hpet_elapsed_ns as u128) as u64
+    };
+
+    let _ = writeln!(
+        console,
+        "lapic timer: {ticks_per_second} ticks/s at divisor {TIMER_DIVISOR}, \
+         measured over {} ms of HPET",
+        CALIBRATION_NS / 1_000_000,
+    );
+    if ticks_per_second == 0 {
+        return Err("the local APIC's timer measured as stopped");
+    }
+
+    *HPET.lock() = Some(hpet);
+    Ok(ticks_per_second)
+}
+
+/// Run the timer at [`TIMER_HZ`] and check the rate against the HPET.
+///
+/// The criterion for this phase, and it is a *measurement* rather than a
+/// presence check: a hundred ticks at a hundred hertz must take a second, to
+/// within two per cent, as timed by the clock that was not involved in producing
+/// them.
+///
+/// That two per cent is what makes it a test. A calibration that read the wrong
+/// register, used the wrong divisor encoding, or divided in the wrong direction
+/// still produces a timer that ticks — steadily, forever, at the wrong rate — and
+/// nothing but a second clock can tell.
+///
+/// # Safety
+/// Called once, after [`init_timer`], on the boot core.
+pub unsafe fn selftest_timer(console: &mut Console, ticks_per_second: u64) -> bool {
+    /// How many ticks to time. A hundred at a hundred hertz is one second.
+    const WANTED: u64 = 100;
+    /// The tolerance the roadmap names.
+    const TOLERANCE_PERCENT: u64 = 2;
+
+    let count = ticks_per_second / u64::from(TIMER_HZ);
+    let Ok(count) = u32::try_from(count) else {
+        let _ = writeln!(console, "timer SELF-TEST FAILED: {TIMER_HZ} Hz does not fit in the count register");
+        return false;
+    };
+    if count == 0 {
+        let _ = writeln!(console, "timer SELF-TEST FAILED: the timer is slower than {TIMER_HZ} Hz");
+        return false;
+    }
+
+    TIMER_VECTOR.store(LAPIC_TIMER_VECTOR, Ordering::SeqCst);
+    TICKS.store(0, Ordering::SeqCst);
+
+    let start = {
+        let mut slot = HPET.lock();
+        let Some(hpet) = slot.as_mut() else {
+            let _ = writeln!(console, "timer SELF-TEST FAILED: no HPET to measure against");
+            return false;
+        };
+        hpet.now()
+    };
+
+    {
+        let mut slot = LAPIC.lock();
+        let Some(lapic) = slot.as_mut() else {
+            let _ = writeln!(console, "timer SELF-TEST FAILED: no local APIC");
+            return false;
+        };
+        lapic.start_timer_periodic(LAPIC_TIMER_VECTOR, count);
+    }
+    let _ = writeln!(
+        console,
+        "lapic timer: periodic, {count} ticks per interrupt on vector {LAPIC_TIMER_VECTOR} \
+         ({TIMER_HZ} Hz nominal)"
+    );
+
+    // SAFETY: the IDT is installed, the local APIC is enabled, and the only
+    // unmasked source is the timer that was just programmed.
+    unsafe { cpu::enable_interrupts() };
+
+    // Bounded by the HPET rather than by a spin count, which is the difference
+    // this phase makes: there is a clock now, so "give up after two seconds"
+    // is expressible as two seconds instead of as a number of loop iterations
+    // that had to be guessed and was guessed wrong once already.
+    let deadline_ns = 2 * (WANTED * 1_000_000_000 / u64::from(TIMER_HZ));
+    loop {
+        if TICKS.load(Ordering::Relaxed) >= WANTED {
+            break;
+        }
+        let overdue = {
+            let mut slot = HPET.lock();
+            let Some(hpet) = slot.as_mut() else { break };
+            let now = hpet.now();
+            hpet.elapsed_ns(start, now) > deadline_ns
+        };
+        if overdue {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+
+    // SAFETY: nothing after this expects to be interrupted; phase 2.4 is what
+    // gives the ticks something to do.
+    unsafe { cpu::disable_interrupts() };
+    let end = HPET.lock().as_mut().map_or(start, Hpet::now);
+    if let Some(lapic) = LAPIC.lock().as_mut() {
+        lapic.stop_timer();
+    }
+
+    let ticks = TICKS.load(Ordering::SeqCst);
+    let elapsed_ns = HPET
+        .lock()
+        .as_ref()
+        .map_or(0, |h| h.elapsed_ns(start, end));
+
+    if ticks < WANTED {
+        let _ = writeln!(
+            console,
+            "timer SELF-TEST FAILED: {ticks} of {WANTED} interrupts in {} ms",
+            elapsed_ns / 1_000_000,
+        );
+        return false;
+    }
+
+    let expected_ns = WANTED * 1_000_000_000 / u64::from(TIMER_HZ);
+    let error_ns = elapsed_ns.abs_diff(expected_ns);
+    let error_permille = error_ns * 1000 / expected_ns;
+    let within = error_permille <= TOLERANCE_PERCENT * 10;
+
+    let _ = writeln!(
+        console,
+        "timer: {ticks} interrupts at {TIMER_HZ} Hz took {}.{:03} s by the HPET \
+         ({}.{}% off, tolerance {TOLERANCE_PERCENT}%)",
+        elapsed_ns / 1_000_000_000,
+        (elapsed_ns % 1_000_000_000) / 1_000_000,
+        error_permille / 10,
+        error_permille % 10,
+    );
+    if !within {
+        let _ = writeln!(
+            console,
+            "timer SELF-TEST FAILED: the calibrated rate is wrong by more than {TOLERANCE_PERCENT}%"
+        );
+    }
+    within
 }

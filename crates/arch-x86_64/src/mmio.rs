@@ -26,6 +26,25 @@ pub unsafe trait Mmio32 {
     fn write(&mut self, offset: usize, value: u32);
 }
 
+/// The same, for devices whose registers are 64 bits wide.
+///
+/// A separate trait rather than two more methods on [`Mmio32`], because the
+/// devices genuinely differ: the APICs are 32-bit registers on 16-byte centres
+/// and reading one as 64 bits reads a reserved word with it, while the HPET's
+/// main counter is a single 64-bit register and reading it as two 32-bit halves
+/// can straddle a carry — returning a time that never existed. Which width a
+/// device wants is a property of the device, so it is in the type.
+///
+/// # Safety
+/// As [`Mmio32`], and each access must be a single 64-bit operation rather than
+/// two 32-bit ones.
+pub unsafe trait Mmio64 {
+    /// Read the 64-bit register at `offset` bytes from the base.
+    fn read64(&mut self, offset: usize) -> u64;
+    /// Write the 64-bit register at `offset` bytes from the base.
+    fn write64(&mut self, offset: usize, value: u64);
+}
+
 /// A device's registers, reached through a mapping the kernel made.
 pub struct MappedRegisters {
     base: *mut u8,
@@ -73,5 +92,22 @@ unsafe impl Mmio32 for MappedRegisters {
         debug_assert!(offset.is_multiple_of(4), "MMIO register offsets are 4-byte aligned");
         // SAFETY: as above.
         unsafe { self.base.add(offset).cast::<u32>().write_volatile(value) };
+    }
+}
+
+// SAFETY: as the 32-bit implementation, with 8-byte accesses at 8-byte aligned
+// offsets. `read_volatile` of a `u64` is one instruction on x86-64, which is what
+// makes reading the HPET's counter atomic with respect to its own carry.
+unsafe impl Mmio64 for MappedRegisters {
+    fn read64(&mut self, offset: usize) -> u64 {
+        debug_assert!(offset.is_multiple_of(8), "64-bit registers are 8-byte aligned");
+        // SAFETY: as above.
+        unsafe { self.base.add(offset).cast::<u64>().read_volatile() }
+    }
+
+    fn write64(&mut self, offset: usize, value: u64) {
+        debug_assert!(offset.is_multiple_of(8), "64-bit registers are 8-byte aligned");
+        // SAFETY: as above.
+        unsafe { self.base.add(offset).cast::<u64>().write_volatile(value) };
     }
 }

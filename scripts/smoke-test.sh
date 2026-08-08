@@ -208,9 +208,28 @@ expect "$L" "interrupts arrived through the I/O APIC and were acknowledged at th
 forbid "$L" "a redirection entry did not read back" 'entry read back as'
 forbid "$L" "the local APIC raised a spurious interrupt" 'spurious from the local APIC'
 
+# --- phase 2.3: a clock, and knowing how fast it runs ----------------------
+# The HPET states its own period in femtoseconds, which is what makes it the one
+# clock that needs no calibration and therefore the ruler for every other. The
+# period is in the *upper* half of a 64-bit register: read it as 32 bits and it
+# comes back zero, which is why the kernel refuses a zero period rather than
+# dividing by it.
+expect "$L" "the HPET was found and decoded" \
+    'hpet: [0-9]+ Hz \([0-9]+ fs per tick\), [0-9]+ comparators, 64-bit counter'
+expect "$L" "the APIC timer was measured, not assumed" \
+    'lapic timer: [0-9]+ ticks/s at divisor 16, measured over [0-9]+ ms of HPET'
+expect "$L" "the timer runs periodically on its own vector" \
+    'lapic timer: periodic, [0-9]+ ticks per interrupt on vector 49 \(100 Hz nominal\)'
+# The criterion, and it is a measurement rather than a presence check: a
+# calibration that read the wrong register or divided the wrong way still ticks
+# steadily forever, at the wrong rate, and only a second clock can tell. Observed
+# error over repeated boots is 0.0-0.1%; the tolerance is 2%.
+expect "$L" "a hundred ticks at 100 Hz took a second by the HPET" \
+    'timer: 100 interrupts at 100 Hz took (0\.9[89][0-9]|1\.0[01][0-9]) s by the HPET \([01]\.[0-9]% off, tolerance 2%\)'
+
 forbid "$L" "a self-test reported failure"   'SELF-TEST FAILED|did not converge|self-test FAILED'
 forbid "$L" "a phase was claimed after a failure" 'not claiming phase'
-expect "$L" "boot reached the end of phase 2.2" 'phase 2.2 complete'
+expect "$L" "boot reached the end of phase 2.3" 'phase 2.3 complete'
 
 # The last act: a deliberate stack overflow. Without a TSS, an IST and a #DF
 # gate this is a triple fault and the log simply stops - which is exactly what

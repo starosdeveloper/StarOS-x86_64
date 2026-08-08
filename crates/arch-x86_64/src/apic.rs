@@ -62,6 +62,43 @@ pub mod lapic_reg {
     pub const LVT_LINT1: usize = 0x360;
     /// Local vector table: internal error.
     pub const LVT_ERROR: usize = 0x370;
+    /// Timer initial count. Writing a non-zero value starts the countdown;
+    /// writing zero stops it.
+    pub const TIMER_INITIAL_COUNT: usize = 0x380;
+    /// Timer current count, counting down. Read-only.
+    pub const TIMER_CURRENT_COUNT: usize = 0x390;
+    /// Timer divide configuration.
+    pub const TIMER_DIVIDE: usize = 0x3E0;
+}
+
+/// Bits 17..18 of the timer's LVT entry: fire once and stop.
+pub const TIMER_ONE_SHOT: u32 = 0b00 << 17;
+/// Fire, reload from the initial count, and fire again.
+pub const TIMER_PERIODIC: u32 = 0b01 << 17;
+
+/// The divide-configuration value for a divisor, or `None` if the APIC cannot
+/// produce it.
+///
+/// The encoding is not a logarithm and not contiguous: bit 2 is **reserved**, so
+/// the three significant bits are 0, 1 and 3. Divisors 2 through 16 are `n - 1`
+/// in the low two bits; 32 through 128 set bit 3 as well; and divide-by-one is
+/// `0b1011`, which is past all of them rather than before. Writing `log2(divisor)`
+/// — the obvious thing — asks for a divisor between one and four times wrong
+/// depending on the value, and nothing reports it: the timer simply runs at a
+/// rate the calibration then measures and believes.
+#[must_use]
+pub const fn timer_divide_bits(divisor: u32) -> Option<u32> {
+    match divisor {
+        1 => Some(0b1011),
+        2 => Some(0b0000),
+        4 => Some(0b0001),
+        8 => Some(0b0010),
+        16 => Some(0b0011),
+        32 => Some(0b1000),
+        64 => Some(0b1001),
+        128 => Some(0b1010),
+        _ => None,
+    }
 }
 
 /// Bit 8 of [`lapic_reg::SPURIOUS`]: the software enable.
@@ -153,6 +190,55 @@ impl<M: Mmio32> LocalApic<M> {
     /// an EOI always clears its highest-priority bit. There is nothing to name.
     pub fn end_of_interrupt(&mut self) {
         self.regs.write(lapic_reg::EOI, 0);
+    }
+
+    /// Set the timer's input divisor.
+    ///
+    /// Returns whether the divisor is one the hardware can produce. See
+    /// [`timer_divide_bits`] for why this is not `log2`.
+    pub fn set_timer_divisor(&mut self, divisor: u32) -> bool {
+        let Some(bits) = timer_divide_bits(divisor) else {
+            return false;
+        };
+        self.regs.write(lapic_reg::TIMER_DIVIDE, bits);
+        true
+    }
+
+    /// Start the timer counting down from `count`, with the interrupt **masked**.
+    ///
+    /// This is the calibration mode. The count is readable while it runs, so the
+    /// elapsed ticks can be measured against another clock without an interrupt
+    /// ever being delivered — which matters, because calibration happens before
+    /// there is anything sensible for a timer interrupt to do.
+    pub fn start_timer_masked(&mut self, count: u32) {
+        self.regs.write(lapic_reg::LVT_TIMER, LVT_MASKED | TIMER_ONE_SHOT);
+        self.regs.write(lapic_reg::TIMER_INITIAL_COUNT, count);
+    }
+
+    /// Start the timer firing `vector` every `count` ticks, forever.
+    ///
+    /// Order matters: the LVT entry is programmed **before** the initial count,
+    /// because writing the count is what starts the countdown. The other way
+    /// round leaves a window in which the timer is running and the vector it will
+    /// deliver on is still whatever was there before.
+    pub fn start_timer_periodic(&mut self, vector: u8, count: u32) {
+        self.regs.write(lapic_reg::LVT_TIMER, TIMER_PERIODIC | u32::from(vector));
+        self.regs.write(lapic_reg::TIMER_INITIAL_COUNT, count);
+    }
+
+    /// Stop the timer and mask its vector.
+    ///
+    /// Both, and in this order. Zeroing the initial count stops the countdown;
+    /// masking the LVT stops a delivery that was already in flight from arriving
+    /// after the caller believes the timer is off.
+    pub fn stop_timer(&mut self) {
+        self.regs.write(lapic_reg::TIMER_INITIAL_COUNT, 0);
+        self.regs.write(lapic_reg::LVT_TIMER, LVT_MASKED);
+    }
+
+    /// The timer's current count, counting down towards zero.
+    pub fn timer_count(&mut self) -> u32 {
+        self.regs.read(lapic_reg::TIMER_CURRENT_COUNT)
     }
 }
 
@@ -510,6 +596,110 @@ mod tests {
         lapic.regs.state.insert(lapic_reg::VERSION, 0x0006_0014);
         assert_eq!(lapic.version(), 0x14);
         assert_eq!(lapic.lvt_entries(), 7);
+    }
+
+    #[test]
+    fn the_divide_encoding_is_not_a_logarithm() {
+        // Bit 2 is reserved, so the three significant bits are 0, 1 and 3 — and
+        // divide-by-one is past the whole range rather than before it. Writing
+        // log2(divisor) is the obvious thing and is wrong for every value.
+        assert_eq!(timer_divide_bits(1), Some(0b1011));
+        assert_eq!(timer_divide_bits(2), Some(0b0000));
+        assert_eq!(timer_divide_bits(4), Some(0b0001));
+        assert_eq!(timer_divide_bits(8), Some(0b0010));
+        assert_eq!(timer_divide_bits(16), Some(0b0011));
+        assert_eq!(timer_divide_bits(32), Some(0b1000));
+        assert_eq!(timer_divide_bits(64), Some(0b1001));
+        assert_eq!(timer_divide_bits(128), Some(0b1010));
+        // Every legal encoding leaves bit 2 clear.
+        for d in [1u32, 2, 4, 8, 16, 32, 64, 128] {
+            assert_eq!(timer_divide_bits(d).unwrap() & 0b100, 0, "divisor {d} sets the reserved bit");
+        }
+        // And the encoding is a bijection: two divisors sharing a value would
+        // mean one of them silently becomes the other.
+        let mut seen = [false; 16];
+        for d in [1u32, 2, 4, 8, 16, 32, 64, 128] {
+            let bits = timer_divide_bits(d).unwrap() as usize;
+            assert!(!seen[bits], "two divisors encode to {bits:#06b}");
+            seen[bits] = true;
+        }
+    }
+
+    #[test]
+    fn a_divisor_the_hardware_cannot_produce_is_refused() {
+        // Not rounded to a neighbour: the calibration multiplies by the divisor
+        // it believes it set, so a silent substitution makes every later
+        // measurement wrong by that ratio.
+        for d in [0u32, 3, 5, 6, 100, 256, u32::MAX] {
+            assert_eq!(timer_divide_bits(d), None, "divisor {d} was accepted");
+        }
+        let mut lapic = LocalApic::new(Recorder::default());
+        assert!(!lapic.set_timer_divisor(3));
+        assert!(lapic.regs.writes.is_empty(), "a refused divisor still wrote a register");
+        assert!(lapic.set_timer_divisor(16));
+        assert_eq!(lapic.regs.writes, vec![(lapic_reg::TIMER_DIVIDE, 0b0011)]);
+    }
+
+    #[test]
+    fn calibration_runs_the_timer_with_the_interrupt_masked() {
+        // Calibration happens before there is anything for a timer interrupt to
+        // do, so the count has to be measurable without one being delivered.
+        let mut lapic = LocalApic::new(Recorder::default());
+        lapic.start_timer_masked(0xFFFF_FFFF);
+        assert_eq!(
+            lapic.regs.writes,
+            vec![
+                (lapic_reg::LVT_TIMER, LVT_MASKED | TIMER_ONE_SHOT),
+                (lapic_reg::TIMER_INITIAL_COUNT, 0xFFFF_FFFF),
+            ],
+        );
+    }
+
+    #[test]
+    fn the_periodic_vector_is_programmed_before_the_countdown_starts() {
+        // Writing the initial count is what starts the timer. Doing it first
+        // leaves a window where the timer is running and the vector it will
+        // deliver on is whatever was in the register before.
+        let mut lapic = LocalApic::new(Recorder::default());
+        lapic.start_timer_periodic(49, 1000);
+        assert_eq!(
+            lapic.regs.writes,
+            vec![
+                (lapic_reg::LVT_TIMER, TIMER_PERIODIC | 49),
+                (lapic_reg::TIMER_INITIAL_COUNT, 1000),
+            ],
+        );
+        // Periodic is mode 01 at bit 17, and the entry must not be masked or it
+        // counts down and delivers nothing.
+        assert_eq!((TIMER_PERIODIC >> 17) & 0b11, 1);
+        assert_eq!(TIMER_PERIODIC & LVT_MASKED, 0);
+        assert_eq!((TIMER_ONE_SHOT >> 17) & 0b11, 0);
+    }
+
+    #[test]
+    fn stopping_the_timer_zeroes_the_count_before_masking() {
+        let mut lapic = LocalApic::new(Recorder::default());
+        lapic.stop_timer();
+        assert_eq!(
+            lapic.regs.writes,
+            vec![
+                (lapic_reg::TIMER_INITIAL_COUNT, 0),
+                (lapic_reg::LVT_TIMER, LVT_MASKED),
+            ],
+        );
+    }
+
+    #[test]
+    fn the_timer_registers_are_where_the_architecture_puts_them() {
+        assert_eq!(lapic_reg::TIMER_INITIAL_COUNT, 0x380);
+        assert_eq!(lapic_reg::TIMER_CURRENT_COUNT, 0x390);
+        assert_eq!(lapic_reg::TIMER_DIVIDE, 0x3E0);
+        // The current count is read-only; reading it must not be confused with
+        // the initial count, which is 16 bytes below it and writable.
+        let mut lapic = LocalApic::new(Recorder::default());
+        lapic.regs.state.insert(lapic_reg::TIMER_CURRENT_COUNT, 12345);
+        lapic.regs.state.insert(lapic_reg::TIMER_INITIAL_COUNT, 99999);
+        assert_eq!(lapic.timer_count(), 12345);
     }
 
     #[test]

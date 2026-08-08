@@ -25,6 +25,8 @@
 //!   [`port`] is one.
 //! - [`apic`] — the local APIC and the I/O APIC: the controller that replaces
 //!   the 8259s, and the place the HAL's interrupt trait had to be reshaped.
+//! - [`hpet`] — the one clock on the machine that states its own frequency, and
+//!   therefore the ruler every other clock is cut against.
 //! - [`selftest`] — faults taken on purpose, because a correct IDT and a subtly
 //!   wrong one are both silent until something faults.
 //!
@@ -53,6 +55,7 @@
 pub mod apic;
 pub mod cpu;
 pub mod gdt;
+pub mod hpet;
 pub mod idt;
 pub mod mmio;
 pub mod pic;
