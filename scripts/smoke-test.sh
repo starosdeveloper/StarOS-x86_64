@@ -15,8 +15,15 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 TIMEOUT="${TIMEOUT:-60}"
-LOG_DIR="$(mktemp -d)"
-trap 'rm -rf "$LOG_DIR"' EXIT
+
+# A fixed directory, emptied at the start and kept afterwards. Deleting the logs
+# on the way out means a failure report can say which patterns did not match and
+# nothing about why — and when the cause is QEMU refusing to start rather than
+# the kernel misbehaving, every assertion fails identically and the one line that
+# explains it has already been thrown away.
+LOG_DIR="target/smoke-test"
+rm -rf "$LOG_DIR"
+mkdir -p "$LOG_DIR"
 
 PASS=0
 FAIL=0
@@ -48,7 +55,11 @@ boot() {
     shift
     # The kernel halts rather than exiting, so QEMU never returns on its own;
     # the timeout *is* the end of the run, not a failure.
-    timeout "$TIMEOUT" ./scripts/run-qemu.sh --headless "$@" > "$log" 2>&1 || true
+    #
+    # stdin from /dev/null: `-serial stdio` makes QEMU take the terminal and put
+    # it in raw mode, which is right when a person runs it by hand and wrong for
+    # four boots in a row sharing a terminal with whatever else is attached.
+    timeout "$TIMEOUT" ./scripts/run-qemu.sh --headless "$@" > "$log" 2>&1 < /dev/null || true
 }
 
 # Assert on the captured screen. Delegated to a real file rather than inlined:
@@ -231,7 +242,15 @@ cp "$GOOD" target/esp/staros/kernel
 echo
 if [ "$FAIL" -eq 0 ]; then
     echo "smoke test PASSED - $PASS assertions"
+    echo "logs in $LOG_DIR"
     exit 0
 fi
 echo "smoke test FAILED - $FAIL of $((PASS + FAIL)) assertions" >&2
+echo "  --- last of the good boot ---" >&2
+if [ -s "$LOG_DIR/good.log" ]; then
+    tail -20 "$LOG_DIR/good.log" | sed 's/^/  | /' >&2
+else
+    echo "  | (empty: QEMU produced no output at all)" >&2
+fi
+echo "full logs in $LOG_DIR" >&2
 exit 1

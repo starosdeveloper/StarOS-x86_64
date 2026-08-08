@@ -32,12 +32,23 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 TIMEOUT="${TIMEOUT:-45}"
-LOG_DIR="$(mktemp -d)"
-trap 'rm -rf "$LOG_DIR"' EXIT
+
+# A fixed directory, emptied at the start and *kept* afterwards. A matrix that
+# deletes its logs on the way out can tell you that twelve assertions failed and
+# nothing whatsoever about why — and the first thing that goes wrong is usually
+# not an assertion at all but QEMU refusing to start, which leaves every case
+# failing identically and the evidence in a temporary directory that no longer
+# exists.
+LOG_DIR="target/boot-matrix"
+rm -rf "$LOG_DIR"
+mkdir -p "$LOG_DIR"
 
 PASS=0
 FAIL=0
 CASE=""
+# Failures within the current case, so a case that goes wrong can show its log
+# once rather than every assertion showing it.
+CASE_FAILED=0
 
 expect() {
     local log="$1" what="$2" pattern="$3"
@@ -45,6 +56,7 @@ expect() {
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))
+        CASE_FAILED=$((CASE_FAILED + 1))
         echo "  [$CASE] MISSING: $what" >&2
         echo "           expected /$pattern/" >&2
     fi
@@ -54,6 +66,7 @@ forbid() {
     local log="$1" what="$2" pattern="$3"
     if grep -qE -- "$pattern" "$log"; then
         FAIL=$((FAIL + 1))
+        CASE_FAILED=$((CASE_FAILED + 1))
         echo "  [$CASE] PRESENT BUT FORBIDDEN: $what" >&2
         grep -nE -- "$pattern" "$log" | head -3 >&2
     else
@@ -61,12 +74,39 @@ forbid() {
     fi
 }
 
+# Announce a case and reset its failure count.
+begin() {
+    CASE="$1"
+    CASE_FAILED=0
+    echo "==> [$CASE]"
+}
+
+# Show what the machine actually said, if this case went wrong. Without it the
+# report says which patterns did not match and leaves the reader to guess
+# whether the kernel misbehaved or QEMU never started.
+end() {
+    local log="$1"
+    [ "$CASE_FAILED" -eq 0 ] && return 0
+    echo "  --- last of $log ---" >&2
+    if [ -s "$log" ]; then
+        tail -20 "$log" | sed 's/^/  | /' >&2
+    else
+        echo "  | (empty: QEMU produced no output at all)" >&2
+    fi
+    echo "  ---" >&2
+}
+
 # Boot with extra QEMU arguments appended. Later options win for `-cpu` and
 # `-vga`, which is what lets a case override what run-qemu.sh chose.
+#
+# stdin comes from /dev/null: `run-qemu.sh` passes `-serial stdio`, so QEMU takes
+# the terminal and puts it in raw mode. That is what is wanted when a person runs
+# it, and exactly wrong here — seven of them in a row, fighting over the same
+# terminal with whatever else is attached to it.
 boot() {
     local log="$1"
     shift
-    timeout "$TIMEOUT" ./scripts/run-qemu.sh --headless -- "$@" > "$log" 2>&1 || true
+    timeout "$TIMEOUT" ./scripts/run-qemu.sh --headless -- "$@" > "$log" 2>&1 < /dev/null || true
 }
 
 # Every case must get through the whole boot, whatever else it does differently.
@@ -92,8 +132,7 @@ echo "==> staging (debug)"
 ./scripts/mkesp.sh > /dev/null
 
 # ---------------------------------------------------------------------------
-CASE="cpu without 1 GiB pages"
-echo "==> [$CASE]"
+begin "cpu without 1 GiB pages"
 L="$LOG_DIR/qemu64.log"
 boot "$L" -cpu qemu64
 reached_the_end "$L"
@@ -106,10 +145,10 @@ expect "$L" "SMAP reported as absent"              'smap unsupported'
 expect "$L" "the SMAP self-test said why it was skipped" \
     'smap: not supported by this CPU, self-test skipped'
 forbid "$L" "claimed a protection the CPU lacks"   'smep on|smap on'
+end "$L"
 
 # ---------------------------------------------------------------------------
-CASE="128 MiB of RAM"
-echo "==> [$CASE]"
+begin "128 MiB of RAM"
 L="$LOG_DIR/small.log"
 boot "$L" -m 128M
 reached_the_end "$L"
@@ -125,10 +164,10 @@ expect "$L" "heap and pool both fit"  'memory: heap [0-9]+ KiB at 0x[0-9a-f]+, p
 # The linear map has a 4 GiB floor precisely so the framebuffer, which lives
 # above RAM, stays reachable on a machine this small.
 expect "$L" "the linear map still reaches the framebuffer" 'linear 4 GiB'
+end "$L"
 
 # ---------------------------------------------------------------------------
-CASE="4 GiB of RAM"
-echo "==> [$CASE]"
+begin "4 GiB of RAM"
 L="$LOG_DIR/big.log"
 boot "$L" -m 4G
 reached_the_end "$L"
@@ -152,10 +191,10 @@ expect "$L" "the pool grew with the machine"     'pool [0-9]{4,} MiB'
 # is the line that has to change.
 expect "$L" "the single-pool limitation is still exactly this" \
     'pool [0-9]+ MiB at 0x[0-9a-f]+ \(262144 frames managed\)'
+end "$L"
 
 # ---------------------------------------------------------------------------
-CASE="no display"
-echo "==> [$CASE]"
+begin "no display"
 L="$LOG_DIR/novga.log"
 boot "$L" -vga none
 reached_the_end "$L"
@@ -166,20 +205,20 @@ expect "$L" "the loader said so rather than carrying on" \
 expect "$L" "the kernel was told there is none" 'framebuffer: none reported by firmware'
 forbid "$L" "the screen was attached anyway" 'console: mirroring to the screen'
 forbid "$L" "the console tried and failed"   'console: screen unusable'
+end "$L"
 
 # ---------------------------------------------------------------------------
-CASE="four cores"
-echo "==> [$CASE]"
+begin "four cores"
 L="$LOG_DIR/smp.log"
 boot "$L" -smp 4
 reached_the_end "$L"
 # Nothing starts the other three, so this is really a test that firmware parking
 # them does not disturb the boot core rewriting CR3 and CR4.
 forbid "$L" "output from a second core interleaved" 'STAR OS microkernel.*STAR OS microkernel'
+end "$L"
 
 # ---------------------------------------------------------------------------
-CASE="i440fx chipset"
-echo "==> [$CASE]"
+begin "i440fx chipset"
 L="$LOG_DIR/i440fx.log"
 boot "$L" -machine pc
 reached_the_end "$L"
@@ -191,10 +230,10 @@ reached_the_end "$L"
 forbid "$L" "the linear map stretched"      'linear [0-9]{3,} GiB'
 expect "$L" "RAM was found and mapped"      'RAM tops out at 0x[0-9a-f]+'
 expect "$L" "a pool was built"              'pool [0-9]+ MiB'
+end "$L"
 
 # ---------------------------------------------------------------------------
-CASE="release profile"
-echo "==> [$CASE]"
+begin "release profile"
 ./scripts/mkesp.sh --release > /dev/null
 L="$LOG_DIR/release.log"
 boot "$L"
@@ -205,12 +244,15 @@ reached_the_end "$L"
 expect "$L" "a null dereference still faults" 'trap: #PF at 0x0'
 expect "$L" "SMAP still refuses the write"    'smap: the write faulted and did not happen'
 expect "$L" "int3 still returns"              'trap: #BP at RIP=0x[0-9a-f]+, resuming'
+end "$L"
 ./scripts/mkesp.sh > /dev/null
 
 echo
 if [ "$FAIL" -eq 0 ]; then
     echo "boot matrix PASSED - $PASS assertions across 7 machines"
+    echo "logs in $LOG_DIR"
     exit 0
 fi
 echo "boot matrix FAILED - $FAIL of $((PASS + FAIL)) assertions" >&2
+echo "full logs in $LOG_DIR" >&2
 exit 1
