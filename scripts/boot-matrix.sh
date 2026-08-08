@@ -188,15 +188,23 @@ expect "$L" "RAM extends past the 4 GiB floor" 'RAM tops out at 0x180000000[^0-9
 expect "$L" "the linear map grew past its floor" 'linear [5-9] GiB|linear [1-9][0-9]+ GiB'
 forbid "$L" "the aperture stretched it"          'linear [0-9]{3,} GiB'
 expect "$L" "the pool grew with the machine"     'pool [0-9]{4,} MiB'
-# What this machine makes visible, and it is a real limitation rather than a
-# bug: the pool is *one* contiguous run, and the buddy allocator rounds that run
-# down to a power of two. A 4 GiB guest reports about 4042 MiB usable, splits it
-# either side of the PCI hole so the largest single run is about 1956 MiB, and
-# the allocator then manages 1024 MiB of it. Roughly a quarter of the machine.
-# Asserted so it stays visible: when phase 1.4's "one pool" becomes several, this
-# is the line that has to change.
-expect "$L" "the single-pool limitation is still exactly this" \
-    'pool [0-9]+ MiB at 0x[0-9a-f]+ \(262144 frames managed\)'
+# This machine is the one that used to make the loss visible, so it is the one
+# that now has to prove the loss is gone. A 4 GiB guest reports about 4041 MiB
+# usable, splits it either side of the PCI hole, and the exclusions cut two more
+# holes in whichever half the kernel landed in. Taking only the largest run and
+# rounding it down to a power of two managed 1024 MiB of that - a quarter of the
+# machine, asserted rather than fixed.
+#
+# Now every run goes in and each is decomposed into powers of two, so the pool is
+# within a heap's worth of all the usable memory there is.
+expect "$L" "the pool covers essentially all usable RAM" 'pool 40[0-9]{2} MiB over '
+forbid "$L" "usable RAM left unmanaged"          'is not under management'
+expect "$L" "the runs on both sides of the hole are in" \
+    'pool [0-9]+ MiB over ([2-9]|[0-9]{2,}) run\(s\)'
+# The metadata bill this buys: 8 bytes per frame over four times as many frames.
+# Asserted as a bound so a future change to the decomposition cannot quietly make
+# it ten times rather than four.
+expect "$L" "the heap grew to pay for it, but only so far" 'heap [0-9]{4} KiB at 0x'
 end "$L"
 
 # ---------------------------------------------------------------------------

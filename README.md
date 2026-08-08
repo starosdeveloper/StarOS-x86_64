@@ -30,12 +30,12 @@ cargo kbuild        # kernel ELF   -> x86_64-unknown-none
 cargo kloader       # loader EFI   -> x86_64-unknown-uefi
 cargo kclippy       # clippy, kernel
 cargo kloader-clippy
-cargo ktest-host    # the crates this tree owns (149 tests)
+cargo ktest-host    # the crates this tree owns (157 tests)
 
 ./scripts/mkesp.sh       # build both halves, stage an ESP layout
 ./scripts/run-qemu.sh    # boot it: OVMF -> BOOTX64.EFI -> kernel
-./scripts/smoke-test.sh  # boot it and assert on the output (73 assertions)
-./scripts/boot-matrix.sh # boot it on six other machines (123 assertions)
+./scripts/smoke-test.sh  # boot it and assert on the output (75 assertions)
+./scripts/boot-matrix.sh # boot it on six other machines (126 assertions)
 ```
 
 Shared crates are tested in `../kernel-new` (`cargo ktest-host` there), so their
@@ -184,13 +184,24 @@ not merely that the boot finished.
 | `-machine pc` | a different chipset, so the memory map is read rather than recognised |
 | `--release` | LTO and `opt-level = "z"` over naked functions, inline assembly and a linker script |
 
-The 4 GiB machine is the one that makes a current limitation visible, so the
-matrix asserts on it rather than letting it pass unnoticed: the frame pool is a
-single contiguous run, and the buddy allocator rounds that run down to a power of
-two. A 4 GiB guest reports 4042 MiB usable, splits it around the PCI hole so the
-largest run is 1956 MiB, and the allocator manages 1024 MiB of that — about a
-quarter of the machine. Not a bug, but not free either, and the line that has to
-change when one pool becomes several.
+The 4 GiB machine earned its place by making a real limitation visible, and it
+now guards the fix. The frame pool used to be a *single* contiguous run handed to
+a *single* buddy tree, which rounds down to a power of two — so a guest reporting
+4041 MiB usable, split around the PCI hole into a largest run of 1956 MiB, ended
+up managing 1024 MiB. A quarter of the machine, asserted by this matrix and
+thereby made visible without being made acceptable.
+
+It takes every free run now, and `staros_mm::FramePool` decomposes each into its
+binary expansion — 1956 frames becomes 1024 + 512 + 256 + 128 + 32 + 4, one buddy
+tree per piece — so nothing is rounded away. The same guest manages 4032 MiB, and
+the kernel computes what it *failed* to manage and prints it, which the matrix
+forbids ever appearing. The price is metadata: four times as many frames tracked
+at 8 bytes each, so the heap goes from 3 MiB to 9 MiB. That is 0.2% of the memory
+it makes usable.
+
+What survives is stated rather than hidden: an allocation is served by one tree
+or refused, never stitched across two, because the frames would not be contiguous
+and contiguity is the only reason to ask for more than one frame at a time.
 
 [`docs/SPEC.md`](docs/SPEC.md) holds the contracts: boot hand-off, memory layout,
 interrupt model, syscall ABI, and every place x86 differs from aarch64 along with

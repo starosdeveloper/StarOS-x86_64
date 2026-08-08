@@ -222,13 +222,26 @@ unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
     mem::describe(console);
     let _ = writeln!(
         console,
-        "memory: heap {} KiB at {:#x}, pool {} MiB at {:#x} ({} frames managed)",
+        "memory: heap {} KiB at {:#x}, pool {} MiB over {} run(s) in {} tree(s), {} frames managed",
         layout.heap.1 / 1024,
         layout.heap.0,
-        layout.pool.1 / (1024 * 1024),
-        layout.pool.0,
+        layout.pool_bytes / (1024 * 1024),
+        layout.pool_runs,
+        layout.pool_trees,
         layout.managed_frames,
     );
+    // The pool takes every whole frame of every run it was given. Saying so as an
+    // equation rather than a claim, because the version before this one managed a
+    // quarter of the machine and reported the number without comment.
+    let unmanaged = layout.usable - layout.heap.1 - layout.managed_frames as u64 * 4096;
+    if unmanaged != 0 || layout.truncated_runs != 0 {
+        let _ = writeln!(
+            console,
+            "memory: {} KiB of usable RAM is not under management ({} run(s) did not fit)",
+            unmanaged / 1024,
+            layout.truncated_runs,
+        );
+    }
 
     // The kernel's own page tables. After this the loader's tree is gone, and
     // with it the identity map that has been keeping address zero alive.

@@ -132,7 +132,18 @@ expect "$L" "both recoverable traps returned" 'both traps returned to their call
 # --- phase 1.4: the kernel's own memory ------------------------------------
 expect "$L" "memory map summarised"          'memory: [0-9]+ MiB described, [0-9]+ MiB usable, RAM tops out at 0x'
 expect "$L" "the map itself is printed"      '^  0x[0-9a-f]+\.\.0x[0-9a-f]+ +[0-9]+ KiB  usable'
-expect "$L" "heap and pool carved"           'memory: heap [0-9]+ KiB at 0x[0-9a-f]+, pool [0-9]+ MiB at 0x[0-9a-f]+ \([0-9]+ frames managed\)'
+expect "$L" "heap and pool carved"           'memory: heap [0-9]+ KiB at 0x[0-9a-f]+, pool [0-9]+ MiB over [0-9]+ run\(s\) in [0-9]+ tree\(s\), [0-9]+ frames managed'
+# Every free run goes into the pool, and each is decomposed into powers of two so
+# nothing is rounded away. The line above is only interesting because of the line
+# below not appearing: the kernel computes what it failed to manage and says so.
+# The version before this one managed a quarter of a 4 GiB machine and reported
+# the number without comment.
+forbid "$L" "usable RAM left unmanaged"      'is not under management'
+# More than one run, because a PC's usable memory never is one run: firmware
+# fragments the low megabyte and the exclusions cut holes in whatever range the
+# kernel landed in. A pool of exactly one run means the runs are being discarded
+# again.
+expect "$L" "the pool spans several runs"    'pool [0-9]+ MiB over ([2-9]|[0-9]{2,}) run\(s\)'
 # The tree is walked before it is loaded, because a bad `mov cr3` is a triple
 # fault with nothing printed - there is no fault report to read afterwards.
 expect "$L" "the new tree verified before the switch" \

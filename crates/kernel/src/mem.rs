@@ -7,21 +7,34 @@
 //!    memory the map itself calls `LoaderReclaimable`, and the whole point of
 //!    this module is to start handing that memory out. So it is copied into the
 //!    kernel's own `.bss` first, before anything can allocate over it.
-//! 2. **Carve the heap.** [`BuddyFrameAllocator`] keeps its tree on the heap and
-//!    sizes it from the pool, so the heap has to exist before the pool does —
-//!    and it cannot come *from* the pool. It is cut off the front of the largest
-//!    free run, and the pool gets the rest.
+//! 2. **Carve the heap.** [`FramePool`] keeps its trees on the heap and sizes
+//!    them from the memory it manages, so the heap has to exist before the pool
+//!    does — and it cannot come *from* the pool. It is cut off the front of the
+//!    largest free run, and the pool gets the rest of that one plus every other
+//!    run whole.
 //! 3. **Build the pool.** Everything that is not plainly free is excluded first:
 //!    the kernel image, the boot info, the map, an initramfs. All four sit
-//!    *inside* ranges the firmware calls usable, so "largest usable range" is not
-//!    an answer until they are carved out.
+//!    *inside* ranges the firmware calls usable, so "usable ranges" is not an
+//!    answer until they are carved out.
 //!
-//! The arithmetic for step 3 is [`staros_bootinfo::largest_free_run`], which is
+//! The arithmetic for step 3 is [`staros_bootinfo::free_runs`], which is
 //! host-tested — placing a pool over the kernel image is not a bug that reports
 //! itself.
+//!
+//! ## Every run, not the largest
+//! This used to take `largest_free_run` and hand that one run to one buddy tree,
+//! which rounds down to a power of two. On a 4 GiB PC that managed 1024 MiB of
+//! 4041: half the machine lost to the PCI hole splitting RAM in two, and half of
+//! what was left lost to the rounding. The number was even asserted by the boot
+//! matrix — visible, and still wrong.
+//!
+//! Now every free run goes in, and [`FramePool`] decomposes each into its binary
+//! expansion so nothing is rounded away. The same machine manages 4032 MiB. The
+//! price is metadata: four times as many frames tracked, so the heap grows from
+//! 3 MiB to 9 MiB, which is 0.2% of the memory it makes usable.
 
 use staros_bootinfo::{BootInfo, MemoryRegion};
-use staros_mm::{BuddyFrameAllocator, FrameAllocator, PhysAddr, PAGE_SIZE};
+use staros_mm::{FramePool, PhysAddr, PAGE_SIZE};
 
 use crate::heap;
 use crate::sync::SpinLock;
@@ -45,7 +58,7 @@ static mut REGIONS: [MemoryRegion; MAX_REGIONS] =
 static COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// The frame allocator, or `None` until [`init`] runs.
-static FRAMES: SpinLock<Option<BuddyFrameAllocator>> = SpinLock::new(None);
+static FRAMES: SpinLock<Option<FramePool>> = SpinLock::new(None);
 
 /// What [`init`] worked out, for the boot log and for the mapper.
 #[derive(Clone, Copy, Debug)]
@@ -60,9 +73,19 @@ pub struct Layout {
     pub highest_ram: u64,
     /// Physical base and length of the heap.
     pub heap: (u64, u64),
-    /// Physical base and length of the frame pool.
-    pub pool: (u64, u64),
-    /// Frames actually under management (the pool rounded down to a power of two).
+    /// How many separate free runs the pool was given.
+    pub pool_runs: usize,
+    /// How many buddy trees those runs decomposed into.
+    pub pool_trees: usize,
+    /// Total bytes handed to the pool.
+    pub pool_bytes: u64,
+    /// Free runs that existed but did not fit in the fixed-size array. Memory the
+    /// kernel is knowingly not using, and it says so rather than losing it
+    /// quietly.
+    pub truncated_runs: usize,
+    /// Frames actually under management. Equal to `pool_bytes / PAGE_SIZE` now
+    /// that nothing is rounded away — which is the point, and why it is still
+    /// reported separately rather than assumed.
     pub managed_frames: usize,
 }
 
@@ -137,29 +160,64 @@ pub unsafe fn init(info: &BootInfo, info_phys: u64) -> Result<Layout, Error> {
     exclusions[2] = (info_phys, size_of::<BootInfo>() as u64);
     exclusions[3] = info.initrd().unwrap_or((0, 0));
 
-    let (start, len) =
-        staros_bootinfo::largest_free_run(regions, &exclusions).ok_or(Error::NoFreeRun)?;
+    // Every free run, not the largest. The difference is most of the machine: a
+    // 4 GiB PC splits RAM either side of the PCI hole, and the exclusions above
+    // cut two more holes in whichever half the kernel landed in.
+    let mut runs = [(0u64, 0u64); staros_bootinfo::MAX_FREE_RUNS];
+    let found = staros_bootinfo::free_runs(regions, &exclusions, &mut runs);
+    let kept = found.min(runs.len());
+    if kept == 0 {
+        return Err(Error::NoFreeRun);
+    }
+    let runs = &mut runs[..kept];
 
-    // The tree is sized from the pool, and the pool is what is left after the
-    // heap — so size the tree from the whole run and accept a slightly larger
-    // heap than strictly needed. The alternative is a fixed point iteration to
-    // save a few kilobytes.
-    let tree = BuddyFrameAllocator::metadata_bytes(len as usize) as u64;
-    let heap_len = (tree + HEAP_SLACK).next_multiple_of(PAGE_SIZE as u64);
-    if heap_len >= len {
+    // The heap has to exist before the pool, because the pool's trees live on it —
+    // and it has to be carved out of one of these same runs, because there is
+    // nowhere else. The largest run pays for it; the pool gets what is left of
+    // that one plus all the others whole.
+    //
+    // Sizing it needs the *total*, since the pool now manages every run. This
+    // over-estimates slightly: the heap is subtracted from a run after the bill is
+    // computed, so the bill covers a few frames the pool will not get. Paying a
+    // kilobyte to avoid a fixed-point iteration.
+    let mut as_usize = [(0usize, 0usize); staros_bootinfo::MAX_FREE_RUNS];
+    for (dst, &(start, len)) in as_usize.iter_mut().zip(runs.iter()) {
+        *dst = (start as usize, len as usize);
+    }
+    let trees = FramePool::metadata_bytes_for(&as_usize[..kept]) as u64;
+    let heap_len = (trees + HEAP_SLACK).next_multiple_of(PAGE_SIZE as u64);
+
+    // Take the heap off the front of the largest run, so the shortening costs the
+    // pool its least useful frames rather than fragmenting a small run away
+    // entirely.
+    let biggest = runs
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, &(_, len))| len)
+        .map(|(i, _)| i)
+        .ok_or(Error::NoFreeRun)?;
+    if runs[biggest].1 <= heap_len {
         return Err(Error::TooSmall);
     }
-    let (heap_start, pool_start, pool_len) = (start, start + heap_len, len - heap_len);
+    let heap_start = runs[biggest].0;
+    runs[biggest] = (heap_start + heap_len, runs[biggest].1 - heap_len);
 
     // SAFETY: the run came from the map as free, the exclusions kept everything
     // live out of it, it is page-aligned and page-sized, and it is handed over as
-    // its linear-map address because the heap writes through it. The pool below
-    // starts past the end of it, so nothing else owns these bytes.
+    // its linear-map address because the heap writes through it. The pool below is
+    // given the rest of that run and never these bytes.
     unsafe { heap::init(staros_bootinfo::phys_to_virt(heap_start) as usize, heap_len as usize) };
 
-    let pool = BuddyFrameAllocator::new(PhysAddr(pool_start as usize), pool_len as usize)
-        .map_err(|_| Error::PoolRejected)?;
+    let mut pool = FramePool::new();
+    for &(start, len) in runs.iter() {
+        // A run too short for a whole frame adds nothing and is not an error;
+        // firmware maps are full of them.
+        pool.add(PhysAddr(start as usize), len as usize)
+            .map_err(|_| Error::PoolRejected)?;
+    }
     let managed_frames = pool.frames();
+    let pool_trees = pool.trees();
+    let pool_bytes = runs.iter().map(|&(_, len)| len).sum();
     *FRAMES.lock() = Some(pool);
 
     Ok(Layout {
@@ -168,7 +226,10 @@ pub unsafe fn init(info: &BootInfo, info_phys: u64) -> Result<Layout, Error> {
         highest: stats.highest_address,
         highest_ram: stats.highest_ram,
         heap: (heap_start, heap_len),
-        pool: (pool_start, pool_len),
+        pool_runs: kept,
+        pool_trees,
+        pool_bytes,
+        truncated_runs: found.saturating_sub(kept),
         managed_frames,
     })
 }
@@ -244,7 +305,7 @@ pub fn describe(console: &mut crate::console::Console) {
 ///
 /// # Panics
 /// If [`init`] has not run.
-pub fn with<R>(f: impl FnOnce(&mut BuddyFrameAllocator) -> R) -> R {
+pub fn with<R>(f: impl FnOnce(&mut FramePool) -> R) -> R {
     let mut slot = FRAMES.lock();
     let alloc = slot.as_mut().expect("frame allocator used before init");
     f(alloc)
@@ -252,7 +313,7 @@ pub fn with<R>(f: impl FnOnce(&mut BuddyFrameAllocator) -> R) -> R {
 
 /// Allocate one frame, or `None` when memory is exhausted.
 pub fn alloc_frame() -> Option<PhysAddr> {
-    with(|a| a.allocate())
+    with(|a| a.alloc_pages(1))
 }
 
 /// Return a frame to the pool.
@@ -260,23 +321,27 @@ pub fn free_frame(frame: PhysAddr) {
     with(|a| a.free_pages(frame));
 }
 
-/// The longest run of contiguous free frames.
+/// The sum, over the pool's trees, of each tree's longest free run.
 ///
 /// The cheapest honest answer to "did everything come back?": it equals the
-/// managed frame count exactly when the pool is entirely free *and* fully
-/// coalesced, so one leaked frame anywhere drops it.
-pub fn largest_free_run() -> usize {
-    with(|a| a.largest_free_run())
+/// managed frame count exactly when every tree is entirely free *and* fully
+/// coalesced, so one leaked frame in any tree drops it.
+///
+/// Not `largest_free_run`, which is the largest single allocation the pool could
+/// satisfy — a useful number, and the wrong one for this question now that there
+/// is more than one tree.
+pub fn coalesced_frames() -> usize {
+    with(|a| a.coalesced_frames())
 }
 
 /// Allocate and free until the pool has to coalesce, and check that it did.
 ///
 /// The same test the aarch64 tree runs, and it works because
-/// [`BuddyFrameAllocator::largest_free_run`] is a property of the *tree*, not a
-/// count: it equals the managed frame count only when every frame is free **and**
-/// every buddy has been merged back. One leaked frame in the middle of the pool
-/// halves it. So a single number, compared before and after, catches both a leak
-/// and a failure to coalesce, without the allocator tracking owners.
+/// [`coalesced_frames`] is a property of the *trees*, not a count: it equals the
+/// managed frame count only when every frame is free **and** every buddy has been
+/// merged back. One leaked frame anywhere drops it. So a single number, compared
+/// before and after, catches both a leak and a failure to coalesce, without the
+/// allocator tracking owners.
 ///
 /// Sizes and free order come from a fixed-seed xorshift, so a failure is
 /// reproducible — a random order that cannot be replayed is not a test, it is an
@@ -301,7 +366,7 @@ pub fn selftest(console: &mut crate::console::Console) -> bool {
     const ROUNDS: usize = 4;
     const BLOCKS: usize = 64;
 
-    let before = largest_free_run();
+    let before = coalesced_frames();
     let mut rng = 0x2545_F491_4F6C_DD1D_u64;
     let mut held = [PhysAddr(0); BLOCKS];
     let mut failures = 0usize;
@@ -332,7 +397,7 @@ pub fn selftest(console: &mut crate::console::Console) -> bool {
         for &block in &held[..n] {
             free_frame(block);
         }
-        let after = largest_free_run();
+        let after = coalesced_frames();
         if after != before {
             let _ = writeln!(
                 console,
@@ -347,7 +412,7 @@ pub fn selftest(console: &mut crate::console::Console) -> bool {
         let _ = writeln!(
             console,
             "frames: {ROUNDS} rounds of up to {BLOCKS} allocations converged, \
-             largest free run back to {before} frames (the page tables hold the rest)"
+             {before} frames free and coalesced (the page tables hold the rest)"
         );
     }
     failures == 0

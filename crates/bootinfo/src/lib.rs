@@ -384,40 +384,118 @@ pub fn summarise(regions: &[MemoryRegion]) -> MemoryStats {
 /// The largest usable range that does not overlap any of `exclusions`, as
 /// `(start, len)`.
 ///
-/// This is how the frame pool is placed. The kernel image, the boot info, the
-/// memory map itself and an initramfs all sit *inside* memory the firmware calls
-/// usable, so "largest usable range" is not an answer until they are carved out.
-/// Each exclusion splits a candidate in two and the larger half survives.
+/// Kept because placing a single thing — the heap — still wants a single answer.
+/// The frame pool wants [`free_runs`] instead: it manages all of them.
 #[must_use]
 pub fn largest_free_run(
     regions: &[MemoryRegion],
     exclusions: &[(u64, u64)],
 ) -> Option<(u64, u64)> {
     let mut best: Option<(u64, u64)> = None;
-    for r in regions.iter().filter(|r| r.kind.usable_at_boot() && r.len > 0) {
-        let mut candidates = [(r.start, r.end()); 1];
-        // Apply exclusions one at a time, keeping only the larger surviving half.
-        // Two exclusions inside one region can therefore lose the middle piece —
-        // acceptable for placing one pool, and stated rather than hidden.
-        for &(ex_start, ex_len) in exclusions {
-            let ex_end = ex_start.saturating_add(ex_len);
-            let (start, end) = candidates[0];
-            if ex_end <= start || ex_start >= end {
-                continue; // disjoint
-            }
-            let left = (start, ex_start.min(end));
-            let right = (ex_end.max(start), end);
-            let left_len = left.1.saturating_sub(left.0);
-            let right_len = right.1.saturating_sub(right.0);
-            candidates[0] = if left_len >= right_len { left } else { right };
-        }
-        let (start, end) = candidates[0];
-        let len = end.saturating_sub(start);
-        if len > 0 && best.is_none_or(|(_, best_len)| len > best_len) {
+    let mut scratch = [(0u64, 0u64); MAX_FREE_RUNS];
+    let found = free_runs(regions, exclusions, &mut scratch);
+    for &(start, len) in &scratch[..found.min(MAX_FREE_RUNS)] {
+        if best.is_none_or(|(_, best_len)| len > best_len) {
             best = Some((start, len));
         }
     }
     best
+}
+
+/// How many free runs the fixed-size paths here can hold.
+///
+/// Firmware maps have a few dozen usable ranges at most, and four exclusions can
+/// split at most four of them in two. This is generous for both.
+pub const MAX_FREE_RUNS: usize = 96;
+
+/// Every usable run with all of `exclusions` carved out, written into `out`.
+///
+/// Returns how many runs exist — which may exceed `out.len()`, so a caller can
+/// tell "forty runs, room for thirty-two" from "thirty-two runs". Runs past the
+/// end of `out` are counted and dropped; the ones written are always genuinely
+/// free, because handing back *fewer* runs than exist can only waste memory while
+/// handing back one that overlaps live data corrupts it.
+///
+/// This is how the frame pool is placed. The kernel image, the boot info, the
+/// memory map itself and an initramfs all sit *inside* memory the firmware calls
+/// usable, so "usable ranges" is not an answer until they are carved out — and an
+/// exclusion in the middle of a range splits it into **two** free runs, both of
+/// which are real memory. The earlier version of this kept only the larger half,
+/// which was fine when one pool was being placed and is exactly the waste this
+/// replaces: a 4 GiB machine lost about three quarters of its RAM between that
+/// and the allocator's power-of-two rounding.
+#[must_use]
+pub fn free_runs(
+    regions: &[MemoryRegion],
+    exclusions: &[(u64, u64)],
+    out: &mut [(u64, u64)],
+) -> usize {
+    // `out` holds `(start, end)` pairs while the exclusions are applied, and is
+    // converted to `(start, len)` at the end. Working in end-coordinates is what
+    // makes splitting a range a matter of two comparisons instead of four.
+    let mut n = 0usize;
+
+    for r in regions.iter().filter(|r| r.kind.usable_at_boot() && r.len > 0) {
+        if let Some(slot) = out.get_mut(n) {
+            *slot = (r.start, r.end());
+        }
+        n += 1;
+    }
+    // Anything past the end of `out` was never written, so it cannot be split
+    // correctly and must not be reported. Fold the count down to what is real.
+    let mut live = n.min(out.len());
+
+    for &(ex_start, ex_len) in exclusions {
+        let ex_end = ex_start.saturating_add(ex_len);
+        if ex_end <= ex_start {
+            continue; // an empty exclusion excludes nothing
+        }
+        // Only the runs that existed before this exclusion need testing: a piece
+        // this exclusion just created is by construction outside it.
+        let before = live;
+        for i in 0..before {
+            let (start, end) = out[i];
+            if ex_end <= start || ex_start >= end {
+                continue; // disjoint
+            }
+            let left = (start, ex_start.max(start).min(end));
+            let right = (ex_end.min(end).max(start), end);
+            let left_len = left.1 - left.0;
+            let right_len = right.1 - right.0;
+
+            // Keep the left piece in place and append the right one. When there is
+            // no room to append, keep whichever piece is larger — dropping memory
+            // is safe, keeping memory that is not free is not.
+            match (left_len > 0, right_len > 0) {
+                (true, true) => {
+                    if live < out.len() {
+                        out[i] = left;
+                        out[live] = right;
+                        live += 1;
+                    } else {
+                        out[i] = if left_len >= right_len { left } else { right };
+                    }
+                }
+                (true, false) => out[i] = left,
+                (false, true) => out[i] = right,
+                // The exclusion swallowed the run whole. Mark it empty; the
+                // compaction below removes it.
+                (false, false) => out[i] = (start, start),
+            }
+        }
+    }
+
+    // Compact away the empty runs and convert to `(start, len)`.
+    let mut kept = 0usize;
+    for i in 0..live {
+        let (start, end) = out[i];
+        if end > start {
+            out[kept] = (start, end - start);
+            kept += 1;
+        }
+    }
+    // The runs that never fit are still counted, so the caller can see it.
+    kept + n.saturating_sub(out.len())
 }
 
 #[cfg(test)]
@@ -553,6 +631,143 @@ mod tests {
         // Kernel at 10 MiB, 2 MiB long: 10 MiB below it, 88 above.
         let run = largest_free_run(&map, &[(10 * MIB, 2 * MIB)]);
         assert_eq!(run, Some((12 * MIB, 88 * MIB)));
+    }
+
+    /// Collect `free_runs` into a sorted vector, which is what every assertion
+    /// about it wants — the order runs come out in is an implementation detail
+    /// (left piece in place, right piece appended), and asserting on it would
+    /// make the tests fragile about something nobody depends on.
+    fn runs(map: &[MemoryRegion], exclusions: &[(u64, u64)]) -> Vec<(u64, u64)> {
+        let mut out = [(0u64, 0u64); MAX_FREE_RUNS];
+        let n = free_runs(map, exclusions, &mut out);
+        assert!(n <= MAX_FREE_RUNS, "{n} runs did not fit");
+        let mut v = out[..n].to_vec();
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn an_exclusion_in_the_middle_yields_both_halves() {
+        // The waste this replaces. `largest_free_run` keeps 88 MiB and discards
+        // the 10 below the kernel; those 10 MiB are memory.
+        let map = [MemoryRegion::new(0, 100 * MIB, MemoryKind::Usable)];
+        assert_eq!(
+            runs(&map, &[(10 * MIB, 2 * MIB)]),
+            vec![(0, 10 * MIB), (12 * MIB, 88 * MIB)],
+        );
+    }
+
+    #[test]
+    fn two_exclusions_in_one_region_no_longer_lose_the_middle() {
+        // Exactly the case the old comment admitted to losing. The kernel image
+        // and an initramfs in the same range leave three free pieces, and the
+        // middle one was silently dropped.
+        let map = [MemoryRegion::new(0, 100 * MIB, MemoryKind::Usable)];
+        assert_eq!(
+            runs(&map, &[(10 * MIB, 2 * MIB), (50 * MIB, 4 * MIB)]),
+            vec![(0, 10 * MIB), (12 * MIB, 38 * MIB), (54 * MIB, 46 * MIB)],
+        );
+    }
+
+    #[test]
+    fn every_usable_region_is_returned_not_just_the_biggest() {
+        // A 4 GiB PC: RAM either side of the PCI hole. Keeping only the largest
+        // discarded whichever side lost, which is about half the machine.
+        let map = [
+            MemoryRegion::new(0x10_0000, 2048 * MIB, MemoryKind::Usable),
+            MemoryRegion::new(0x1_0000_0000, 1994 * MIB, MemoryKind::Usable),
+            MemoryRegion::new(0xFD_0000_0000, 12 * 1024 * MIB, MemoryKind::Reserved),
+        ];
+        assert_eq!(
+            runs(&map, &[]),
+            vec![(0x10_0000, 2048 * MIB), (0x1_0000_0000, 1994 * MIB)],
+        );
+    }
+
+    #[test]
+    fn an_exclusion_spanning_two_regions_trims_both() {
+        let map = [
+            MemoryRegion::new(0, 16 * MIB, MemoryKind::Usable),
+            MemoryRegion::new(16 * MIB, 16 * MIB, MemoryKind::Usable),
+        ];
+        // 8..24 MiB is spoken for, cutting the tail off the first region and the
+        // head off the second.
+        assert_eq!(
+            runs(&map, &[(8 * MIB, 16 * MIB)]),
+            vec![(0, 8 * MIB), (24 * MIB, 8 * MIB)],
+        );
+    }
+
+    #[test]
+    fn nothing_returned_ever_overlaps_an_exclusion() {
+        // The property that actually matters. Dropping a free run wastes memory;
+        // returning one that overlaps live data hands the kernel image to the
+        // frame allocator.
+        let map = [
+            MemoryRegion::new(0, 64 * MIB, MemoryKind::Usable),
+            MemoryRegion::new(128 * MIB, 64 * MIB, MemoryKind::Usable),
+        ];
+        let exclusions = [
+            (0, 1 * MIB),
+            (7 * MIB, 3 * MIB),
+            (60 * MIB, 100 * MIB), // spans the gap and into the second region
+            (190 * MIB, 8 * MIB),  // runs past the end of everything
+        ];
+        for (start, len) in runs(&map, &exclusions) {
+            let end = start + len;
+            assert!(len > 0, "an empty run was returned");
+            for &(ex_start, ex_len) in &exclusions {
+                let ex_end = ex_start + ex_len;
+                assert!(
+                    end <= ex_start || start >= ex_end,
+                    "run {start:#x}..{end:#x} overlaps exclusion {ex_start:#x}..{ex_end:#x}",
+                );
+            }
+            // And within a region the firmware called usable.
+            assert!(
+                map.iter().any(|r| r.kind.usable_at_boot() && start >= r.start && end <= r.end()),
+                "run {start:#x}..{end:#x} is not inside any usable region",
+            );
+        }
+    }
+
+    #[test]
+    fn more_runs_than_fit_are_counted_and_the_rest_dropped() {
+        // A caller has to be able to tell "there are more" from "that is all",
+        // and what it gets back must still be usable rather than half-carved.
+        let map: Vec<MemoryRegion> = (0..8)
+            .map(|i| MemoryRegion::new(i * 16 * MIB, 8 * MIB, MemoryKind::Usable))
+            .collect();
+        let mut out = [(0u64, 0u64); 3];
+        let n = free_runs(&map, &[], &mut out);
+        assert_eq!(n, 8, "the count must be the truth, not what fitted");
+        // The three that were written are the first three regions, intact.
+        assert_eq!(out, [(0, 8 * MIB), (16 * MIB, 8 * MIB), (32 * MIB, 8 * MIB)]);
+    }
+
+    #[test]
+    fn an_empty_exclusion_excludes_nothing() {
+        let map = [MemoryRegion::new(0, 16 * MIB, MemoryKind::Usable)];
+        assert_eq!(runs(&map, &[(4 * MIB, 0), (0, 0)]), vec![(0, 16 * MIB)]);
+    }
+
+    #[test]
+    fn largest_free_run_still_agrees_with_free_runs() {
+        // It is implemented in terms of the new one now, so this is the check
+        // that the reimplementation did not change any answer a caller relies on.
+        let map = [
+            MemoryRegion::new(0, 100 * MIB, MemoryKind::Usable),
+            MemoryRegion::new(256 * MIB, 30 * MIB, MemoryKind::Usable),
+        ];
+        for exclusions in [
+            &[][..],
+            &[(10 * MIB, 2 * MIB)][..],
+            &[(0, 99 * MIB)][..],
+            &[(0, 400 * MIB)][..],
+        ] {
+            let expected = runs(&map, exclusions).into_iter().max_by_key(|&(_, len)| len);
+            assert_eq!(largest_free_run(&map, exclusions), expected, "{exclusions:?}");
+        }
     }
 
     #[test]
