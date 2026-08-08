@@ -239,6 +239,21 @@ pub unsafe fn stop_ticking() {
 /// Interrupts that arrived on a line nothing had asked for.
 static UNEXPECTED: AtomicU64 = AtomicU64::new(0);
 
+/// Timer interrupts taken while **ring 3** was executing.
+///
+/// Counted separately because it is the only evidence that `TSS.rsp0` is right.
+/// An interrupt from ring 0 changes no stack — the CPU keeps using the one it
+/// finds — so a kernel task being preempted a thousand times says nothing about
+/// whether a ring-3 task could be preempted once.
+static TICKS_FROM_RING3: AtomicU64 = AtomicU64::new(0);
+
+/// Timer interrupts that arrived while ring 3 was running. See
+/// [`TICKS_FROM_RING3`].
+#[must_use]
+pub fn ticks_from_ring3() -> u64 {
+    TICKS_FROM_RING3.load(Ordering::Relaxed)
+}
+
 /// Spurious interrupts the 8259s raised and then disowned.
 static SPURIOUS: AtomicU64 = AtomicU64::new(0);
 
@@ -350,7 +365,16 @@ fn dispatch_apic(frame: &TrapFrame) {
     }
 
     if vector == TIMER_VECTOR.load(Ordering::Relaxed) {
-        TICKS.fetch_add(1, Ordering::Relaxed);
+        let ticks = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+        if frame.from_user() {
+            TICKS_FROM_RING3.fetch_add(1, Ordering::Relaxed);
+        }
+        // Publish the count where ring 3 can read it. One volatile store into a
+        // page mapped read-only for user space: a task that wants to know how long
+        // it has been running has no other way to ask, and the alternative — a
+        // syscall — would mean changing an ABI both architectures share for the
+        // sake of one program.
+        crate::usermode::publish_ticks(ticks);
         // Ask for a reschedule; do not perform one. The interrupt has not been
         // acknowledged yet and the trap frame is only half unwound, so this
         // records the request and `dispatch` acts on it once both are settled.

@@ -16,7 +16,7 @@ the two drift.
 | `crates/bootinfo` | The loader → kernel hand-off contract: memory map, framebuffer, RSDP, initramfs, and the address-space layout both binaries agree on |
 | `crates/elf64` | ELF64 program headers — how the loader reads a kernel image |
 | `crates/boot-uefi` | The UEFI loader: firmware bindings, ESP access, page tables, `ExitBootServices` |
-| `crates/arch-x86_64` | I/O ports, 16550 UART, CPU control. GDT/IDT, paging, APIC and SMP are scheduled, not stubbed |
+| `crates/arch-x86_64` | I/O ports, 16550 UART, CPU control, GDT/IDT/TSS, trap entry, 8259/8254, APIC, HPET, context switch, `syscall`/`sysret`. SMP is scheduled, not stubbed |
 | `crates/kernel` | The privileged binary |
 
 Two binaries, two targets, on purpose: the loader is PE/COFF for firmware, the
@@ -30,23 +30,23 @@ cargo kbuild        # kernel ELF   -> x86_64-unknown-none
 cargo kloader       # loader EFI   -> x86_64-unknown-uefi
 cargo kclippy       # clippy, kernel
 cargo kloader-clippy
-cargo ktest-host    # the crates this tree owns (181 tests)
+cargo ktest-host    # the crates this tree owns (192 tests)
 
 ./scripts/mkesp.sh       # build both halves, stage an ESP layout
 ./scripts/run-qemu.sh    # boot it: OVMF -> BOOTX64.EFI -> kernel
-./scripts/smoke-test.sh  # boot it and assert on the output (87 assertions)
-./scripts/boot-matrix.sh # boot it on six other machines (168 assertions)
+./scripts/smoke-test.sh  # boot it and assert on the output (99 assertions)
+./scripts/boot-matrix.sh # boot it on six other machines (196 assertions)
 ```
 
 Shared crates are tested in `../kernel-new` (`cargo ktest-host` there), so their
-89 tests are not duplicated here.
+102 tests are not duplicated here.
 
 `mkesp.sh --to /path/to/mounted/esp` writes the same layout onto a real EFI
 partition; `run-qemu.sh --debug` starts stopped with a gdb stub on `:1234`.
 
 ## Status
 
-**Phase 1 and phase 2 complete, verified on live firmware.** OVMF
+**Phases 1 and 2 complete, and phase 3.1, verified on live firmware.** OVMF
 finds `EFI/BOOT/BOOTX64.EFI`; the loader collects the RSDP, the GOP framebuffer,
 the kernel and an optional initramfs off the ESP it was itself loaded from, places
 the `PT_LOAD` segments with their own rights (W^X), builds identity, linear and
@@ -56,10 +56,11 @@ kernel takes its own stack, validates the hand-off, mirrors every message to COM
 and the screen, installs its own GDT, TSS and IDT, takes ownership of physical
 memory, builds its own page tables, moves the 8259s off the CPU's exception
 vectors, reads the interrupt topology out of ACPI, brings up the APICs,
-calibrates its own timer against the HPET, and runs two kernel threads that share
-the CPU without either of them asking to — and proves each of those by faulting,
-interrupting, measuring or preempting on purpose, because a correct table and a
-subtly wrong one are both completely silent until something happens.
+calibrates its own timer against the HPET, runs two kernel threads that share the
+CPU without either of them asking to, and drops into ring 3 to run a program it
+does not trust — and proves each of those by faulting, interrupting, measuring or
+preempting on purpose, because a correct table and a subtly wrong one are both
+completely silent until something happens.
 
 ```
 STAR OS microkernel (x86_64) v0.1.0
@@ -104,7 +105,17 @@ task B: done after 917498 steps
 sched: 33 switches (30 forced by the timer), 2 of 2 tasks finished
 sched: A took 845497 steps and saw B move 14 times; B took 917498 steps and saw A move 14 times
 sched: 2 dead stacks reaped, 64 KiB returned to the heap
-phase 2.4 complete: two tasks shared the CPU, and neither one asked to.
+syscall: enabled, entry 0xffffffff8002a424, kernel cs 0x08, sysret cs 0x2b ss 0x23, fmask 0x54700
+user: 173 byte program at 0x400000 r-x, stack 0x7ffff000 rw-, clock 0x410000 r--
+user: hello from ring 3
+user: preempted while in ring 3, yielded, and came back
+user: 4 syscalls served (0 refused), 80 bytes written, 1 voluntary switch(es)
+user: 16 timer interrupts arrived from ring 3 at 100 Hz (they used TSS.rsp0, nothing else could have)
+sysret: forcing a non-canonical return address (0x800000000000) on the program's first syscall
+user fault: task "N" took vector 13 - #GP general protection fault in ring 3
+  RIP=0x0000800000000000 CS=0x002b RSP=0x000000007ffffff8 SS=0x0023 error=0x0
+  killing the task; the kernel continues
+phase 3.1 complete: code the kernel does not trust ran, and came back.
 
 KERNEL FAULT: vector 8 - #DF double fault
   the first fault was at 0xffffffff80043f68
@@ -203,6 +214,59 @@ the successor is not obviously anyone's responsibility. Removing that hand-off
 changes nothing anyone would notice: thirty preemptions, perfect interleaving,
 both tasks finished, every other assertion green — and 64 KiB gone until reboot.
 The only way to see it is to require that what was created came back.
+
+Ring 3 is where this port stops resembling the sibling tree at all. On AArch64
+`svc` is an exception: it goes through the same vectors as every other trap, the
+hardware switches to `SP_EL1` by itself, and the return address and flags land in
+system registers the kernel can read whenever it likes. `syscall` is not an
+exception — it is a jump that loads `RIP` and `CS`/`SS` from MSRs, destroys `RCX`
+and `R11` by putting the return address and flags in them (which is why the fourth
+syscall argument is `R10`), clears whichever flags `IA32_FMASK` names, and does
+**nothing to `RSP`**. The kernel begins executing with ring-3 privilege gone and
+the ring-3 *stack* still in `RSP`, and every register still belonging to the
+caller, so there is nowhere to put it — which is what `swapgs` and a per-core block
+are for.
+
+`GS` then turns out to be state belonging to the *core*, not to the task, and that
+distinction cost a debugging session. The stub swaps in and swaps out, which
+balances for any syscall that returns. A handler that switches tasks in the middle
+— a `Yield`, or an `Exit` that never comes back — leaves the core running somebody
+else's code with the kernel base still in `GS`. Nothing in ring 0 reads `GS`, so it
+looks harmless. The *next* syscall, from any task, swaps again and gets the user's
+base, and the instruction after that writes through it: a `#PF` inside the entry
+stub, on a user stack, at an address that means nothing, two tasks after the
+mistake.
+
+`TSS.rsp0` is the field with no alternative. A syscall's kernel stack can be
+handed over through `GS` because the kernel writes the entry stub; an *interrupt*
+is delivered by the CPU, which reads `rsp0` out of the TSS before one kernel
+instruction runs. So the boot log's count of "timer interrupts that arrived from
+ring 3" is the only evidence that field is right — an interrupt taken in ring 0
+changes no stack, so a kernel thread being preempted a thousand times proves
+nothing. Blank that write and the first tick in ring 3 is a double fault.
+
+The last check in that block is one the test bench cannot demonstrate, which is
+worth saying plainly. `sysretq` takes `RIP` from `RCX`, and on **Intel** silicon a
+non-canonical value raises `#GP` inside the instruction — before the privilege
+change, in ring 0, at an address ring 3 chose. On AMD it is not checked at all and
+the fault happens on the instruction fetch in ring 3, harmlessly. QEMU's
+interpreter follows AMD whatever CPU model is asked for, so deleting the check from
+this kernel and booting produces an identical log: `#GP` in ring 3, task killed,
+every assertion green. A mitigation that cannot be seen working is one nobody
+notices the removal of, so the boot asserts on the *decision* instead — that one
+return went out through `iretq` rather than `sysretq` — which is false the moment
+the check is gone, on any machine.
+
+`DebugWrite` is the syscall that made the rest of it necessary. It takes a pointer
+into ring 3's memory, so the kernel has to answer two questions it had never faced:
+whether the caller may read that address, and how ring 0 reads it at all with SMAP
+on. The first is a page-table *walk*, not a range check — being in the user half
+proves only that an address is not the kernel's, and dereferencing an unmapped or
+supervisor-only one from ring 0 is a fault in the kernel. The second is `stac`
+around the copy and `clac` after it, a window exactly as wide as the copy. That
+`stac` is conditional, and not for speed: on a CPU without SMAP it is not a no-op
+but an invalid opcode, which is how `-cpu qemu64` in the boot matrix earns its
+place twice over.
 
 The page tables themselves are not checked by booting. `staros-paging` abstracts
 the two things the loader and the kernel do differently — where a table frame

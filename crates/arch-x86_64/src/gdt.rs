@@ -216,10 +216,13 @@ pub unsafe fn install() {
         (*tss).interrupt_stacks[IST_DOUBLE_FAULT as usize - 1] = stack_top(&raw mut DOUBLE_FAULT_STACK);
         (*tss).interrupt_stacks[IST_NMI as usize - 1] = stack_top(&raw mut NMI_STACK);
         (*tss).interrupt_stacks[IST_MACHINE_CHECK as usize - 1] = stack_top(&raw mut MACHINE_CHECK_STACK);
-        // No ring-3 code exists yet, so no transition can consume `rsp0`. It is
-        // left null deliberately: phase 2 must set it to the current thread's
-        // kernel stack, and a null there faults loudly rather than landing on
-        // whatever stack happened to be reused.
+        // `rsp0` stays null here. It is not a value this function can know: the
+        // stack a ring transition must land on is the *current task's* kernel
+        // stack, so the scheduler writes it on every switch (see
+        // [`set_privilege_stack`]). Null until then is deliberate — an interrupt
+        // from ring 3 before anything set it is a `#DF` on a null stack, which is
+        // a report, where a stale value would be a silent write into whatever
+        // memory that stack has since become.
         (*tss).iomap_base = size_of::<Tss>() as u16;
     }
 
@@ -257,6 +260,36 @@ pub unsafe fn install() {
     unsafe {
         asm!("ltr {0:x}", in(reg) TSS_SELECTOR, options(nostack, preserves_flags));
     }
+}
+
+/// Set `TSS.rsp0`: the stack the CPU switches to when an interrupt or exception
+/// arrives while ring 3 is executing.
+///
+/// This is the field with no alternative. `syscall` can be handed a stack through
+/// `GS` because the kernel writes the entry stub; an *interrupt* is delivered by
+/// the CPU, which reads `rsp0` out of the TSS before a single kernel instruction
+/// runs. Leave it stale across a task switch and a timer tick in ring 3 pushes a
+/// trap frame onto some other task's stack.
+///
+/// Called by the scheduler on every switch, with the top of the task's kernel
+/// stack.
+#[cfg(not(test))]
+pub fn set_privilege_stack(rsp: u64) {
+    let tss = &raw mut TSS;
+    // SAFETY: `TSS` is private to this module and written only here and in
+    // `install`, both on the core that owns it, with no concurrent reader in
+    // software — the CPU reads it only during a ring transition, which cannot be
+    // in progress while this core is executing this.
+    unsafe { (*tss).privilege_stacks[0] = rsp };
+}
+
+/// `TSS.rsp0`, read back from the structure the CPU will actually consult.
+#[cfg(not(test))]
+#[must_use]
+pub fn privilege_stack() -> u64 {
+    let tss = &raw const TSS;
+    // SAFETY: as `set_privilege_stack`; a plain read of a private static.
+    unsafe { (*tss).privilege_stacks[0] }
 }
 
 /// Point every segment register at the new table.

@@ -256,9 +256,48 @@ expect "$L" "task B ended dead with its stack reclaimed" \
 # so a task line that does not start at the beginning of a line is the failure.
 forbid "$L" "a task's line was cut into another's" 'task [AB]: [0-9]+ ticks in, [0-9]+ steps, saw the other move [0-9]+ times.+task [AB]:'
 
+# --- phase 3.1: ring 3, syscall/sysret -------------------------------------
+# The selectors sysret forges are derived from IA32_STAR, not written down: a
+# wrong base builds, boots, and loads a plausible wrong selector on the first
+# return to ring 3. 0x2b is USER_CODE|3 and 0x23 is USER_DATA|3, and both must
+# carry RPL 3 or "user" code runs with kernel privilege.
+expect "$L" "syscall was enabled and pointed at the kernel" \
+    'syscall: enabled, entry 0xffffffff[0-9a-f]+, kernel cs 0x08, sysret cs 0x2b ss 0x23'
+# IF (0x200), TF (0x100) and AC (0x40000) are the three that matter: an
+# interrupt on the user stack, a user debugger stepping the kernel, and ring 3
+# switching SMAP off for the kernel's duration.
+expect "$L" "fmask clears IF, TF and AC" 'fmask 0x54700'
+expect "$L" "three user pages with three different rights" \
+    'user: [0-9]+ byte program at 0x400000 r-x, stack 0x7ffff000 rw-, clock 0x410000 r--'
+# Ring 3 ran at all: iretq lowered the privilege level, `syscall` was a valid
+# opcode, LSTAR pointed at the stub, and sysretq came back.
+expect "$L" "ring 3 executed and its output arrived" 'user: hello from ring 3'
+expect "$L" "it came back from a voluntary yield" \
+    'user: preempted while in ring 3, yielded, and came back'
+expect "$L" "the syscalls it made were all understood" \
+    'user: 4 syscalls served \(0 refused\), 80 bytes written, 1 voluntary switch\(es\)'
+# The one thing only ring 3 can demonstrate. An interrupt taken in ring 0
+# changes no stack, so a kernel task being preempted says nothing about rsp0;
+# an interrupt taken in ring 3 has the CPU load TSS.rsp0 before a single kernel
+# instruction runs, and a null or stale value there is a #DF.
+expect "$L" "the timer interrupted ring 3, which needs TSS.rsp0" \
+    'user: [1-9][0-9]* timer interrupts arrived from ring 3 at 100 Hz'
+
+# sysret with a non-canonical RIP raises #GP *before* the drop to ring 3 - in
+# ring 0, on the kernel stack, at an address ring 3 chose. The kernel returns
+# through iretq instead, so the fault lands where it belongs. CS=0x002b is the
+# whole assertion: the same #GP with CS=0x0008 is the escalation.
+expect "$L" "the corrupted return faulted in ring 3, not ring 0" \
+    'user fault: task "N" took vector 13 - #GP general protection fault in ring 3'
+expect "$L" "and it faulted at the address that was forced" \
+    'RIP=0x0000800000000000 CS=0x002b'
+expect "$L" "only the task died"             'killing the task; the kernel continues'
+expect "$L" "the return took the slow path deliberately" 'sysret: [1-9][0-9]* return\(s\) went out through iretq instead'
+forbid "$L" "a fault from ring 3 reached the fatal path" 'KERNEL FAULT: vector 13'
+
 forbid "$L" "a self-test reported failure"   'SELF-TEST FAILED|did not converge|self-test FAILED'
 forbid "$L" "a phase was claimed after a failure" 'not claiming phase'
-expect "$L" "boot reached the end of phase 2.4" 'phase 2.4 complete'
+expect "$L" "boot reached the end of phase 3.1" 'phase 3.1 complete'
 
 # The last act: a deliberate stack overflow. Without a TSS, an IST and a #DF
 # gate this is a triple fault and the log simply stops - which is exactly what

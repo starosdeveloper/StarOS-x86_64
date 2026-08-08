@@ -140,7 +140,16 @@ reached_the_end() {
         'saw B move [1-9][0-9]* times; B took [0-9]+ steps and saw A move [1-9][0-9]* times'
     expect "$log" "dead stacks were reclaimed" \
         'sched: 2 dead stacks reaped, 64 KiB returned to the heap'
-    expect "$log" "the boot claimed the phase" 'phase 2.4 complete'
+    # And ring 3. The step and tick counts are properties of the machine; what is
+    # asserted is that user code ran, that the timer interrupted it *there*
+    # (which needs TSS.rsp0 and nothing else can supply it), and that a forced
+    # non-canonical return faulted in ring 3 rather than in the kernel.
+    expect "$log" "ring 3 ran"                 'user: hello from ring 3'
+    expect "$log" "ring 3 was preemptible"     'user: [1-9][0-9]* timer interrupts arrived from ring 3'
+    expect "$log" "a bad sysret faulted in ring 3" \
+        'user fault: task "N" took vector 13 - #GP general protection fault in ring 3'
+    expect "$log" "and only the task died"     'killing the task; the kernel continues'
+    expect "$log" "the boot claimed the phase" 'phase 3.1 complete'
     forbid "$log" "a self-test failed"         'SELF-TEST FAILED|not claiming phase'
     forbid "$log" "the loader gave up"         'BOOT FAILED'
     forbid "$log" "a panic"                    'KERNEL PANIC'

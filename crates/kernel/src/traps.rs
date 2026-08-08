@@ -116,6 +116,17 @@ fn on_trap(frame: &mut TrapFrame) {
         return;
     }
 
+    // A fault in ring 3 is not the kernel's failure, and this is the first phase
+    // in which that distinction exists. The task that took it is killed; the
+    // kernel keeps running. `sched::exit` never returns, so the trap frame under
+    // us is abandoned along with the stack it sits on — which is correct, because
+    // that stack belongs to the task being destroyed and its successor reclaims it.
+    if frame.from_user() && crate::sched::in_task() {
+        report_user(console, frame, faulting_address);
+        crate::usermode::note_user_fault();
+        crate::sched::exit()
+    }
+
     report(frame, faulting_address);
     cpu::halt()
 }
@@ -153,6 +164,38 @@ fn resume_if_expected(console: &mut Console, frame: &mut TrapFrame, address: u64
     // writing it here steps over the instruction that faulted.
     frame.rip = resume;
     true
+}
+
+/// Report a fault taken in ring 3, which ends a task and nothing else.
+///
+/// Through the ordinary, locked console rather than [`console::emergency`], and
+/// the difference is the whole point: the kernel survives this, so the report has
+/// to take its turn in the log like every other message. The emergency path exists
+/// for reports that are the last thing a core will ever print, and this is not one.
+///
+/// `CS` is printed because it is the evidence. A `#GP` from a bad `sysret` looks
+/// identical to a `#GP` from bad user code *except* in which ring took it, and
+/// getting that wrong is the escalation `staros_arch_x86_64::syscall` exists to
+/// prevent.
+fn report_user(console: &mut Console, frame: &TrapFrame, address: u64) {
+    let _ = writeln!(
+        console,
+        "user fault: task \"{}\" took vector {} - {} in ring {}",
+        crate::sched::current_name(),
+        frame.vector,
+        trap::vector_name(frame.vector),
+        if frame.from_user() { 3 } else { 0 },
+    );
+    let _ = writeln!(
+        console,
+        "  RIP={:#018x} CS={:#06x} RSP={:#018x} SS={:#06x} error={:#x}",
+        frame.rip, frame.cs, frame.rsp, frame.ss, frame.error_code,
+    );
+    if frame.vector == VECTOR_PAGE_FAULT {
+        let cause = PageFaultCause::from_error_code(frame.error_code);
+        let _ = writeln!(console, "  #PF at {:#x}: {}", address, cause.as_str());
+    }
+    let _ = writeln!(console, "  killing the task; the kernel continues");
 }
 
 /// Print everything known about a fault that ends the boot.

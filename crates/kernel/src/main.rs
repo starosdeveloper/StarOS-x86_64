@@ -39,6 +39,7 @@ mod mem;
 mod sched;
 mod sync;
 mod traps;
+mod usermode;
 mod vm;
 
 use core::arch::naked_asm;
@@ -339,6 +340,28 @@ unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
                             // SAFETY: the timer is calibrated, the APICs are up
                             // and the IDT is installed. Runs once.
                             ok &= unsafe { sched::selftest(console) };
+
+                            // And the last thing the kernel owns outright: the
+                            // privilege level. Everything so far has run in ring
+                            // 0, where a bug is the kernel's own; from here there
+                            // is code the kernel does not trust.
+                            //
+                            // SAFETY: the tables are live, the GDT holds the
+                            // selectors `IA32_STAR` names, and interrupts are
+                            // masked. Runs once.
+                            match unsafe { usermode::init(console, &tables) } {
+                                Ok(()) => {
+                                    // SAFETY: `init` succeeded and the timer is
+                                    // calibrated. Runs once.
+                                    ok &= unsafe { usermode::selftest(console) };
+                                    // SAFETY: as above, and after `selftest`.
+                                    ok &= unsafe { usermode::selftest_noncanonical(console) };
+                                }
+                                Err(e) => {
+                                    let _ = writeln!(console, "user SELF-TEST FAILED: {e}");
+                                    ok = false;
+                                }
+                            }
                         }
                         Err(e) => {
                             let _ = writeln!(console, "timer SELF-TEST FAILED: {e}");
@@ -365,12 +388,12 @@ unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
     // that prints "complete" after a failed self-test is worse than one that
     // prints nothing: it is the line a later reader will trust.
     if !ok {
-        let _ = writeln!(console, "a self-test failed; not claiming phase 2.4. Halting.");
+        let _ = writeln!(console, "a self-test failed; not claiming phase 3.1. Halting.");
         cpu::halt()
     }
     let _ = writeln!(
         console,
-        "phase 2.4 complete: two tasks shared the CPU, and neither one asked to."
+        "phase 3.1 complete: code the kernel does not trust ran, and came back."
     );
 
     // And one that does not come back. Last, deliberately: it is the only proof

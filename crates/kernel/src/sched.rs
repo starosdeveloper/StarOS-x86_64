@@ -56,7 +56,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use staros_arch_x86_64::context::{self, context_switch, CpuContext};
-use staros_arch_x86_64::cpu;
+use staros_arch_x86_64::{cpu, gdt, syscall};
 
 use crate::console::Console;
 use crate::kprintln;
@@ -101,11 +101,35 @@ struct Task {
     /// long as the task exists, and an inline array moves whenever the `Vec`
     /// holding it grows. A separate allocation is pinned by construction.
     stack: Box<[u64]>,
+    /// Top of that stack, recorded once at spawn.
+    ///
+    /// Not derived on demand from `stack`, because the reaper replaces a dead
+    /// task's stack with an empty box and the derived answer would then be the
+    /// address of nothing. It is only ever *used* for a live task, but a field
+    /// that is wrong for a dead one is a field waiting to be read by mistake.
+    kernel_stack_top: u64,
     state: State,
     id: usize,
     /// What the boot log calls it. A task is otherwise identified only by a slot
     /// index, and "task 1 finished" is a worse line than "task B finished".
     name: &'static str,
+}
+
+/// Tell the CPU and the syscall path which kernel stack the running task uses.
+///
+/// Called on **every** switch into a task, and the two writes are not
+/// interchangeable. `TSS.rsp0` is what the CPU itself loads when an interrupt
+/// arrives while ring 3 is executing — it reads the TSS before a single kernel
+/// instruction runs, so nothing in software can supply it late.
+/// [`syscall::set_kernel_stack`] is what the `syscall` entry stub reads through
+/// `GS`, because `syscall` does not switch stacks at all.
+///
+/// Both are set for kernel tasks too, which never make either transition. Setting
+/// them unconditionally costs two stores and means there is no state in which the
+/// answer to "which kernel stack" depends on which kind of task is running.
+fn install_kernel_stack(top: u64) {
+    gdt::set_privilege_stack(top);
+    syscall::set_kernel_stack(top);
 }
 
 /// Allocate a zeroed kernel stack, or `None` if the heap is exhausted.
@@ -214,16 +238,22 @@ static SWITCHES: AtomicU64 = AtomicU64::new(0);
 /// happening, whatever else the log says.
 static PREEMPTIONS: AtomicU64 = AtomicU64::new(0);
 
+/// Switches a task asked for itself, through [`yield_now`]. The other half of the
+/// same distinction: a scheduler that only ever preempts and a scheduler that only
+/// ever cooperates both look like "switches happened" from the outside.
+static YIELDS: AtomicU64 = AtomicU64::new(0);
+
 /// Dead-task stacks reclaimed, and the 64-bit words that returned to the heap.
 static REAPED_STACKS: AtomicU64 = AtomicU64::new(0);
 static REAPED_WORDS: AtomicU64 = AtomicU64::new(0);
 
-/// Switches performed, and how many of those were preemptions.
+/// Switches performed, how many were preemptions, and how many were voluntary.
 #[must_use]
-pub fn switch_counts() -> (u64, u64) {
+pub fn switch_counts() -> (u64, u64, u64) {
     (
         SWITCHES.load(Ordering::Relaxed),
         PREEMPTIONS.load(Ordering::Relaxed),
+        YIELDS.load(Ordering::Relaxed),
     )
 }
 
@@ -298,9 +328,14 @@ pub fn spawn(name: &'static str, entry: extern "C" fn()) -> bool {
     if !ctx.init(entry, &mut stack) {
         return false;
     }
+    // The same rounding `context::plant` does, and for the same reason: a
+    // `Box<[u64]>` promises eight-byte alignment, and both `TSS.rsp0` and the
+    // syscall stub push structures the ABI wants sixteen-byte aligned.
+    let kernel_stack_top = (stack.as_ptr() as u64 + stack.len() as u64 * 8) & !0xf;
     let Some(mut task) = try_box(Task {
         ctx,
         stack,
+        kernel_stack_top,
         state: State::Ready,
         id: 0,
         name,
@@ -341,14 +376,16 @@ pub fn start() {
                 // Switching *from* the bootstrap context, which is not a task —
                 // nothing for the successor to settle.
                 PREV.store(NONE, Ordering::Relaxed);
+                let top = sched.tasks[first].kernel_stack_top;
                 let boot: *mut CpuContext = &mut sched.bootstrap;
                 let next: *const CpuContext = &sched.tasks[first].ctx;
-                (boot, next)
+                (boot, next, top)
             })
         };
-        let Some((boot_ptr, next_ptr)) = picked else {
+        let Some((boot_ptr, next_ptr, top)) = picked else {
             break;
         };
+        install_kernel_stack(top);
         SWITCHES.fetch_add(1, Ordering::Relaxed);
         // SAFETY: the two pointers name distinct contexts — the bootstrap's and a
         // task's — the guard has been dropped, and interrupts are masked. We
@@ -361,6 +398,46 @@ pub fn start() {
 
     // SAFETY: restores the interrupt state `kmain` was in.
     unsafe { cpu::irq_restore(saved) };
+}
+
+/// Voluntarily give up the CPU to the next runnable task.
+///
+/// Absent in phase 2.4 because nothing could call it; phase 3.1 gives it its
+/// caller, the `Yield` syscall. Which means the first thing to yield in this
+/// kernel is a ring-3 program, and the round trip it makes — `syscall`, a switch
+/// to another task, a switch back, `sysretq` — is the whole of phase 3.1 in one
+/// instruction.
+///
+/// Interrupts are masked for the switch and restored afterwards, so a syscall
+/// handler that yields comes back in the state it left: masked, on its own kernel
+/// stack, one `sysretq` from ring 3.
+pub fn yield_now() {
+    // SAFETY: reschedule inside an interrupt-masked critical section.
+    let saved = unsafe { cpu::irq_save() };
+    if reschedule() {
+        YIELDS.fetch_add(1, Ordering::Relaxed);
+    }
+    // SAFETY: matching restore; runs when this task is switched back in.
+    unsafe { cpu::irq_restore(saved) };
+}
+
+/// Whether this core is inside a task rather than in its bootstrap context.
+///
+/// Asked by the fault path: a fault from ring 3 kills the task that took it, and
+/// "kill the task" is only an answer when there is one.
+#[must_use]
+pub fn in_task() -> bool {
+    SCHED.lock().current != NONE
+}
+
+/// The name of the running task, or `"bootstrap"` outside one. For fault reports.
+#[must_use]
+pub fn current_name() -> &'static str {
+    let sched = SCHED.lock();
+    if sched.current == NONE {
+        return "bootstrap";
+    }
+    sched.tasks[sched.current].name
 }
 
 /// Ask for a reschedule at the next IRQ epilogue. Called from the timer tick.
@@ -393,6 +470,7 @@ pub fn on_irq_epilogue() {
 fn reschedule() -> bool {
     let prev_ptr: *mut CpuContext;
     let next_ptr: *const CpuContext;
+    let next_top: u64;
     {
         let mut sched = SCHED.lock();
         let prev = sched.current;
@@ -413,9 +491,11 @@ fn reschedule() -> bool {
         // Hand `prev` to our successor. Today it only matters for a dead task's
         // stack; `prev` is alive here, so the successor will find nothing to do.
         PREV.store(prev, Ordering::Relaxed);
+        next_top = sched.tasks[next].kernel_stack_top;
         prev_ptr = &mut sched.tasks[prev].ctx;
         next_ptr = &sched.tasks[next].ctx;
     }
+    install_kernel_stack(next_top);
     SWITCHES.fetch_add(1, Ordering::Relaxed);
     // SAFETY: `pick_next` never returns `prev`, so the two pointers name distinct
     // contexts; the guard is dropped and interrupts are masked. Execution resumes
@@ -439,6 +519,7 @@ pub fn exit() -> ! {
 
     let prev_ptr: *mut CpuContext;
     let next_ptr: *const CpuContext;
+    let next_top: Option<u64>;
     {
         let mut sched = SCHED.lock();
         let prev = sched.current;
@@ -449,15 +530,23 @@ pub fn exit() -> ! {
             Some(next) => {
                 sched.tasks[next].state = State::Running;
                 sched.current = next;
+                next_top = Some(sched.tasks[next].kernel_stack_top);
                 next_ptr = &sched.tasks[next].ctx;
             }
             // Nothing left to run: back to the bootstrap context, which decides
-            // whether the system is finished.
+            // whether the system is finished. The bootstrap runs in ring 0 and
+            // makes no syscalls, so it needs no kernel stack installed — and
+            // leaving the dead task's would be worse than leaving the last live
+            // one's, since its stack is about to be freed.
             None => {
                 sched.current = NONE;
+                next_top = None;
                 next_ptr = &sched.bootstrap;
             }
         }
+    }
+    if let Some(top) = next_top {
+        install_kernel_stack(top);
     }
     SWITCHES.fetch_add(1, Ordering::Relaxed);
     // SAFETY: `prev` is a dead slot used only as a write sink for a context
@@ -633,7 +722,7 @@ pub unsafe fn selftest(console: &mut Console) -> bool {
     unsafe { crate::irq::stop_ticking() };
 
     let finished = FINISHED.load(Ordering::Relaxed);
-    let (switches, preemptions) = switch_counts();
+    let (switches, preemptions, _) = switch_counts();
     let (stacks, bytes) = reaped_stacks();
     let alternations = [
         ALTERNATIONS[0].load(Ordering::Relaxed),

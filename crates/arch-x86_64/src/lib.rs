@@ -29,6 +29,10 @@
 //!   therefore the ruler every other clock is cut against.
 //! - [`context`] — the six callee-saved registers a task switch has to keep, and
 //!   the first stack frame a task that has never run needs in order to start.
+//! - [`syscall`] — `syscall`/`sysret`: the MSRs that turn the instruction on,
+//!   the `swapgs` stack switch x86 needs and AArch64 does not, and the canonical
+//!   check without which `sysret` hands ring 3 a fault in ring 0.
+//! - [`usermode`] — the five-word frame `iretq` reads to drop into ring 3.
 //! - [`selftest`] — faults taken on purpose, because a correct IDT and a subtly
 //!   wrong one are both silent until something faults.
 //!
@@ -68,4 +72,7 @@ pub mod port;
 #[cfg(not(test))]
 pub mod selftest;
 pub mod serial;
+pub mod syscall;
 pub mod trap;
+#[cfg(not(test))]
+pub mod usermode;
