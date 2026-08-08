@@ -144,12 +144,16 @@ reached_the_end() {
     # asserted is that user code ran, that the timer interrupted it *there*
     # (which needs TSS.rsp0 and nothing else can supply it), and that a forced
     # non-canonical return faulted in ring 3 rather than in the kernel.
-    expect "$log" "ring 3 ran"                 'user: hello from ring 3'
+    expect "$log" "a real ELF was loaded"      'user: image [0-9]+ bytes, entry 0x400000, 2 loadable segment\(s\)'
+    expect "$log" "two spaces, not one"        'user: two spaces, cr3 0x[0-9a-f]+ and 0x[0-9a-f]+'
+    expect "$log" "ring 3 ran"                 'user 1: running at 0x400000 in its own address space'
+    expect "$log" "a fault killed only its own task" 'user 1: still running after its neighbour faulted'
+    expect "$log" "the dead trees came back"   'user: 2 address space\(s\) torn down, [0-9]+ frames returned; ([0-9]+) -> \1 frames still out'
     expect "$log" "ring 3 was preemptible"     'user: [1-9][0-9]* timer interrupts arrived from ring 3'
     expect "$log" "a bad sysret faulted in ring 3" \
         'user fault: task "N" took vector 13 - #GP general protection fault in ring 3'
     expect "$log" "and only the task died"     'killing the task; the kernel continues'
-    expect "$log" "the boot claimed the phase" 'phase 3.1 complete'
+    expect "$log" "the boot claimed the phase" 'phase 3.2 complete'
     forbid "$log" "a self-test failed"         'SELF-TEST FAILED|not claiming phase'
     forbid "$log" "the loader gave up"         'BOOT FAILED'
     forbid "$log" "a panic"                    'KERNEL PANIC'

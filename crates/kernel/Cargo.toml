@@ -25,5 +25,6 @@ staros-framebuffer.workspace = true
 staros-drivers.workspace = true
 staros-acpi.workspace = true
 staros-bootinfo.workspace = true
+staros-elf64.workspace = true
 staros-arch-x86-64.workspace = true
 staros-paging.workspace = true

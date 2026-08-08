@@ -4,19 +4,20 @@
 //! [`BootInfo`] in `RDI`, after `ExitBootServices`: the firmware is gone, this
 //! code owns the machine, and nothing is set up that the loader did not set up.
 //!
-//! What runs today is phases 1 and 2 of `docs/ROADMAP.md` — take the kernel's
-//! own stack, validate the hand-off, bring up whatever console exists, install
-//! the CPU tables, take ownership of memory, build the kernel's own page tables,
-//! move the 8259s, bring up the APICs, calibrate a timer against the HPET, and
-//! run two kernel threads under preemption. Every one of those is followed by a
-//! self-test that can fail, because the alternative — a table that is subtly
-//! wrong — is completely silent.
+//! What runs today is phases 1, 2 and 3.1–3.2 of `docs/ROADMAP.md` — take the
+//! kernel's own stack, validate the hand-off, bring up whatever console exists,
+//! install the CPU tables, take ownership of memory, build the kernel's own page
+//! tables, move the 8259s, bring up the APICs, calibrate a timer against the
+//! HPET, run two kernel threads under preemption, and load a separately linked
+//! ELF into two private address spaces to run in ring 3. Every one of those is
+//! followed by a self-test that can fail, because the alternative — a table that
+//! is subtly wrong — is completely silent.
 //!
 //! The order below is not a preference. Each stage is the first thing able to
 //! report the next stage's failure: the console before the CPU tables, the CPU
 //! tables before anything that can fault, memory before the page tables, the page
 //! tables before any device mapping, the interrupt controller before the clock,
-//! the clock before the scheduler.
+//! the clock before the scheduler, the scheduler before ring 3.
 //!
 //! Everything after this is specified in `docs/SPEC.md` and sequenced in
 //! `docs/ROADMAP.md`; those stages are absent here rather than stubbed, so the
@@ -32,6 +33,7 @@
 extern crate alloc;
 
 mod acpi;
+mod addrspace;
 mod console;
 mod heap;
 mod irq;
@@ -353,9 +355,9 @@ unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
                                 Ok(()) => {
                                     // SAFETY: `init` succeeded and the timer is
                                     // calibrated. Runs once.
-                                    ok &= unsafe { usermode::selftest(console) };
+                                    ok &= unsafe { usermode::selftest(console, &tables) };
                                     // SAFETY: as above, and after `selftest`.
-                                    ok &= unsafe { usermode::selftest_noncanonical(console) };
+                                    ok &= unsafe { usermode::selftest_noncanonical(console, &tables) };
                                 }
                                 Err(e) => {
                                     let _ = writeln!(console, "user SELF-TEST FAILED: {e}");
@@ -388,12 +390,12 @@ unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
     // that prints "complete" after a failed self-test is worse than one that
     // prints nothing: it is the line a later reader will trust.
     if !ok {
-        let _ = writeln!(console, "a self-test failed; not claiming phase 3.1. Halting.");
+        let _ = writeln!(console, "a self-test failed; not claiming phase 3.2. Halting.");
         cpu::halt()
     }
     let _ = writeln!(
         console,
-        "phase 3.1 complete: code the kernel does not trust ran, and came back."
+        "phase 3.2 complete: two programs, two address spaces, and one of them died alone."
     );
 
     // And one that does not come back. Last, deliberately: it is the only proof

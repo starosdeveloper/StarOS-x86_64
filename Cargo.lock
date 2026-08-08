@@ -12,6 +12,7 @@ dependencies = [
  "staros-bootinfo",
  "staros-cpio",
  "staros-drivers",
+ "staros-elf64",
  "staros-framebuffer",
  "staros-hal",
  "staros-ipc",

@@ -36,11 +36,17 @@
 //! - [`selftest`] — faults taken on purpose, because a correct IDT and a subtly
 //!   wrong one are both silent until something faults.
 //!
-//! Everything else the port needs — `syscall`/`sysret` entry, per-task address
-//! spaces, the SMP trampoline — is scheduled in `docs/ROADMAP.md` and specified
-//! in `docs/SPEC.md`. They are listed there rather than stubbed here: an empty
-//! function that returns `Ok` is worse than an absent one, because the boot log
-//! then claims a subsystem came up.
+//! Everything else the port needs — IPC, the SMP trampoline — is scheduled in
+//! `docs/ROADMAP.md` and specified in `docs/SPEC.md`. They are listed there
+//! rather than stubbed here: an empty function that returns `Ok` is worse than an
+//! absent one, because the boot log then claims a subsystem came up.
+//!
+//! Per-task address spaces are deliberately *not* here. On aarch64 they are, and
+//! for a good reason — `TTBR0`/`TTBR1` is a hardware split, so the code that
+//! builds one is architecture-specific by nature. Here the four-level walk lives
+//! in the portable, host-tested `staros-paging`, and what remains is policy: which
+//! pages a process gets and who frees them. That belongs in the kernel, and it is
+//! in `crates/kernel/src/addrspace.rs`.
 //!
 //! ## Why this crate has host tests
 //! Most of it cannot have any — `lgdt` does nothing observable off a CPU. But

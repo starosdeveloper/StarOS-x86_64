@@ -117,87 +117,13 @@ pub unsafe fn map_device(tables: &Tables, phys: u64, len: u64) -> Result<u64, &'
 /// hole. Not a policy — it is where the address space stops being canonical.
 pub const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
 
-/// Add a mapping ring 3 can reach.
-///
-/// The one entry point that is allowed to set `PTE_USER`, and it refuses two
-/// things rather than trusting its caller. A range that reaches into the kernel
-/// half would hand user space a kernel address; and rights without `user` would
-/// build a mapping nothing in ring 3 can touch, which is not a user mapping but a
-/// silent one — the page fault it produces later says "supervisor page" and
-/// points at the program, not at the line that made it.
-///
-/// # Errors
-/// When the range leaves the user half, or the mapper refuses it.
-///
-/// # Safety
-/// `phys` must be frames this caller owns, `tables` must be the live tree, and
-/// the mapping must not alias anything ring 3 is not meant to see.
-pub unsafe fn map_user(
-    tables: &Tables,
-    virt: u64,
-    phys: u64,
-    len: u64,
-    rights: Rights,
-) -> Result<(), &'static str> {
-    if !rights.user {
-        return Err("a user mapping without the user bit is a mapping ring 3 cannot use");
-    }
-    if virt >= USER_LIMIT || len > USER_LIMIT - virt {
-        return Err("the range does not fit in the user half of the address space");
-    }
-
-    let mut frames = KernelFrames;
-    let mut mapper = Mapper::adopt(tables.root, &mut frames, tables.gib_pages);
-    mapper.map(virt, phys, len, rights).map_err(MapError::as_str)?;
-    for page in (0..len).step_by(PAGE_SIZE as usize) {
-        // SAFETY: ring 0; these addresses were just given mappings, and the CPU
-        // caches the absence of a translation as readily as its presence.
-        unsafe { cpu::invlpg(virt + page) };
-    }
-    Ok(())
-}
-
-/// Whether every byte of `[ptr, ptr + len)` is reachable from ring 3 — readable,
-/// and writable too if `write`.
-///
-/// The check the kernel owes itself before it dereferences anything a syscall
-/// handed it. It is a *walk*, not a range test, and the difference is the point:
-/// being inside the user half proves only that the address is not the kernel's.
-/// An unmapped user pointer dereferenced in ring 0 is a `#PF` in the kernel — and
-/// with `SMAP` on, so is a *mapped* one the program was never given.
-///
-/// [`staros_paging::Mapper::translate`] returns the rights the **walk** computes
-/// — the AND of `user` and `write` down every level — which is what the CPU
-/// enforces and what a check against the leaf alone would get wrong.
-#[must_use]
-pub fn user_range_ok(tables: &Tables, ptr: u64, len: u64, write: bool) -> bool {
-    if len == 0 {
-        // Nothing to read is trivially readable, and refusing it would make an
-        // empty write an error for no reason.
-        return true;
-    }
-    if ptr >= USER_LIMIT || len > USER_LIMIT - ptr {
-        return false;
-    }
-
-    let mut frames = KernelFrames;
-    let mut mapper = Mapper::adopt(tables.root, &mut frames, tables.gib_pages);
-    let first = ptr & !(PAGE_SIZE - 1);
-    // `len - 1`: a range ending exactly on a page boundary does not touch the
-    // next page, and demanding that page be mapped would reject a valid buffer.
-    let last = (ptr + len - 1) & !(PAGE_SIZE - 1);
-    let mut page = first;
-    loop {
-        match mapper.translate(page) {
-            Some(t) if t.rights.user && (!write || t.rights.write) => {}
-            _ => return false,
-        }
-        if page == last {
-            return true;
-        }
-        page += PAGE_SIZE;
-    }
-}
+// Ring 3's mappings are deliberately not built here. Phase 3.1 hung a few
+// user-accessible pages off the bottom of *this* tree, which was enough to prove
+// `iretq` and `syscall` and proves nothing about isolation. From phase 3.2 every
+// user page lives in a per-task tree — `crate::addrspace::AddressSpace` — and
+// this module builds only the kernel's half, which every one of those trees then
+// shares by copying its top-level entries. There is no `map_user` here any more:
+// a second place able to set `PTE_USER` is a second place that can get it wrong.
 
 unsafe extern "C" {
     static __text_start: u8;
@@ -212,7 +138,7 @@ unsafe extern "C" {
 }
 
 /// Frames from the kernel's own pool, reached through the linear map.
-struct KernelFrames;
+pub(crate) struct KernelFrames;
 
 // SAFETY: `alloc_frame` returns a page-aligned 4 KiB frame owned by nobody else
 // (the pool hands each out once), which is zeroed here before being returned;

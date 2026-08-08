@@ -14,10 +14,11 @@ the two drift.
 |-------|------|
 | `crates/acpi` | ACPI tables — the PC's device tree. RSDP, XSDT/RSDT, MADT, MCFG, HPET. No MMIO, no AML |
 | `crates/bootinfo` | The loader → kernel hand-off contract: memory map, framebuffer, RSDP, initramfs, and the address-space layout both binaries agree on |
-| `crates/elf64` | ELF64 program headers — how the loader reads a kernel image |
+| `crates/elf64` | ELF64 program headers. Two users: the loader reading the kernel image, and the kernel reading a ring-3 program |
 | `crates/boot-uefi` | The UEFI loader: firmware bindings, ESP access, page tables, `ExitBootServices` |
 | `crates/arch-x86_64` | I/O ports, 16550 UART, CPU control, GDT/IDT/TSS, trap entry, 8259/8254, APIC, HPET, context switch, `syscall`/`sysret`. SMP is scheduled, not stubbed |
 | `crates/kernel` | The privileged binary |
+| `services/init/boot` | The ring-3 program: a separately linked ELF the kernel loads at run time, not code baked into its own `.text` |
 
 Two binaries, two targets, on purpose: the loader is PE/COFF for firmware, the
 kernel is ELF for hardware. `docs/SPEC.md` §2.1 explains why they cannot be one —
@@ -34,8 +35,8 @@ cargo ktest-host    # the crates this tree owns (192 tests)
 
 ./scripts/mkesp.sh       # build both halves, stage an ESP layout
 ./scripts/run-qemu.sh    # boot it: OVMF -> BOOTX64.EFI -> kernel
-./scripts/smoke-test.sh  # boot it and assert on the output (99 assertions)
-./scripts/boot-matrix.sh # boot it on six other machines (196 assertions)
+./scripts/smoke-test.sh  # boot it and assert on the output (106 assertions)
+./scripts/boot-matrix.sh # boot it on six other machines (224 assertions)
 ```
 
 Shared crates are tested in `../kernel-new` (`cargo ktest-host` there), so their
@@ -46,7 +47,7 @@ partition; `run-qemu.sh --debug` starts stopped with a gdb stub on `:1234`.
 
 ## Status
 
-**Phases 1 and 2 complete, and phase 3.1, verified on live firmware.** OVMF
+**Phases 1 and 2 complete, and phase 3 through 3.2, verified on live firmware.** OVMF
 finds `EFI/BOOT/BOOTX64.EFI`; the loader collects the RSDP, the GOP framebuffer,
 the kernel and an optional initramfs off the ESP it was itself loaded from, places
 the `PT_LOAD` segments with their own rights (W^X), builds identity, linear and
@@ -57,10 +58,10 @@ and the screen, installs its own GDT, TSS and IDT, takes ownership of physical
 memory, builds its own page tables, moves the 8259s off the CPU's exception
 vectors, reads the interrupt topology out of ACPI, brings up the APICs,
 calibrates its own timer against the HPET, runs two kernel threads that share the
-CPU without either of them asking to, and drops into ring 3 to run a program it
-does not trust — and proves each of those by faulting, interrupting, measuring or
-preempting on purpose, because a correct table and a subtly wrong one are both
-completely silent until something happens.
+CPU without either of them asking to, and loads a separately linked ELF into two
+private address spaces and runs it in ring 3 — and proves each of those by
+faulting, interrupting, measuring or preempting on purpose, because a correct
+table and a subtly wrong one are both completely silent until something happens.
 
 ```
 STAR OS microkernel (x86_64) v0.1.0
@@ -75,7 +76,7 @@ memory: 13059 MiB described, 458 MiB usable, RAM tops out at 0x20000000
 memory: device apertures reach 0x10000000000; the linear map stops at RAM
 memory: heap 1940 KiB at 0x1780000, pool 455 MiB over 11 run(s) in 39 tree(s), 116647 frames managed
 vm: verified - text 0xffffffff800069a0 r-x, rodata r--, data rw-, 0x0 and the guard page absent
-vm: cr3 0x1900000, linear 4 GiB (1 GiB pages), smep on, smap on
+vm: cr3 0x0, linear 4 GiB (1 GiB pages), smep on, smap on
 trap: #PF at 0x0, RIP=0xffffffff800172b8, err=0x0 (read from an unmapped page)
 smap: the write faulted and did not happen
 smap: stac opened the hole, the same write succeeded
@@ -105,17 +106,25 @@ task B: done after 917498 steps
 sched: 33 switches (30 forced by the timer), 2 of 2 tasks finished
 sched: A took 845497 steps and saw B move 14 times; B took 917498 steps and saw A move 14 times
 sched: 2 dead stacks reaped, 64 KiB returned to the heap
-syscall: enabled, entry 0xffffffff8002a424, kernel cs 0x08, sysret cs 0x2b ss 0x23, fmask 0x54700
-user: 173 byte program at 0x400000 r-x, stack 0x7ffff000 rw-, clock 0x410000 r--
-user: hello from ring 3
-user: preempted while in ring 3, yielded, and came back
-user: 4 syscalls served (0 refused), 80 bytes written, 1 voluntary switch(es)
-user: 16 timer interrupts arrived from ring 3 at 100 Hz (they used TSS.rsp0, nothing else could have)
+syscall: enabled, entry 0xffffffff8002da64, kernel cs 0x08, sysret cs 0x2b ss 0x23, fmask 0x54700
+user: image 8768 bytes, entry 0x400000, 2 loadable segment(s)
+user: two spaces, cr3 0xc000 and 0x18000; 0x400000 -> 0xd000 and 0x19000
+user 1: running at 0x400000 in its own address space
+user 2: running at 0x400000 in its own address space
+user 2: dereferencing address zero, which nothing maps here
+user fault: task "U2" took vector 14 - #PF page fault in ring 3
+  RIP=0x0000000000400084 CS=0x002b RSP=0x0000000080000000 SS=0x0023 error=0x4
+  #PF at 0x0: read from an unmapped page
+  killing the task; the kernel continues
+user 1: still running after its neighbour faulted
+user: 6 syscalls served (0 refused), 216 bytes written, 1 Yield call(s) causing 0 switch(es)
+user: 31 timer interrupts arrived from ring 3 at 100 Hz (they used TSS.rsp0, nothing else could have)
+user: 2 address space(s) torn down, 24 frames returned; 12 -> 12 frames still out
 sysret: forcing a non-canonical return address (0x800000000000) on the program's first syscall
 user fault: task "N" took vector 13 - #GP general protection fault in ring 3
   RIP=0x0000800000000000 CS=0x002b RSP=0x000000007ffffff8 SS=0x0023 error=0x0
   killing the task; the kernel continues
-phase 3.1 complete: code the kernel does not trust ran, and came back.
+phase 3.2 complete: two programs, two address spaces, and one of them died alone.
 
 KERNEL FAULT: vector 8 - #DF double fault
   the first fault was at 0xffffffff80043f68
@@ -267,6 +276,56 @@ around the copy and `clac` after it, a window exactly as wide as the copy. That
 `stac` is conditional, and not for speed: on a CPU without SMAP it is not a no-op
 but an invalid opcode, which is how `-cpu qemu64` in the boot matrix earns its
 place twice over.
+
+Phase 3.2 is where the two trees stop resembling each other for the second time.
+AArch64 has two translation base registers: `TTBR1` holds the kernel and never
+changes, `TTBR0` holds the process and is swapped every switch, and the split is
+hardware — a user task cannot name a kernel address because there is no entry for
+it to walk. x86-64 has one register and one tree covering the whole canonical
+space, kernel in the upper half and process in the lower. So a private address
+space here is a **private PML4 whose upper half is a copy of the kernel's**, and a
+switch is a whole `CR3` reload. Copying entries rather than subtrees is what makes
+that safe to do mid-function: every tree points at the same kernel tables, so the
+instruction after the write, the stack under it and the console it may print to are
+mapped identically on both sides.
+
+That arrangement has one failure with no symptom at all. A `PTE_USER` bit on a
+kernel PML4 entry faults nowhere, changes no kernel behaviour and appears in no
+log — it just makes the entire kernel readable from ring 3, and the only thing that
+would ever notice is a program that went looking. So each tree is audited for it as
+it is built, and the count must be zero.
+
+The program is a real, separately linked executable rather than assembly baked into
+the kernel: `build.rs` compiles `services/init/boot/image.rs` with its own linker
+script at 0x400000 — the address a linker gives a non-PIE x86-64 binary by default
+— with a read-execute and a read-write segment, and the kernel reads its entry
+point, segment count and per-segment rights *out of the image*. It is loaded twice,
+into two spaces, and the only difference between the two tasks is one byte the
+kernel seeds sixteen gigabytes above the image. The program stamps that byte into a
+string in `.data` before printing it, so a second segment that was read-only or
+shared would show up as a fault or as the wrong digit.
+
+Two `CR3` values is not isolation. What the log asserts is that one virtual address
+resolves to two different physical frames, and then that a null dereference in one
+task kills that task while the other goes on to print a line it could not otherwise
+reach.
+
+Physical frame 0 is a real frame on a PC, the pool hands it out like any other, and
+on this machine it is what the kernel's own PML4 got — so `CR3` really is zero and
+everything works. Any code reading a zero root as "no root" is therefore broken, and
+one line of this scheduler was: `CR3` stopped being restored after the first ring-3
+task, which surfaced as a triple fault a whole round later, when the freed frame was
+handed out again and zeroed.
+
+The frame accounting had to be rebuilt for the same phase. `coalesced_frames` — the
+sum over trees of each tree's largest free run — equals the managed total exactly
+when the pool is entirely free and fully coalesced, which makes it a perfect
+end-of-boot check and a useless mid-run one: once anything is held permanently the
+largest block is already cut, and cutting it again with fourteen more frames may not
+move the number at all. Leaking every page table of two address spaces went straight
+past it. The kernel now keeps its own ledger of frames handed out and not returned,
+and the phase asserts that building two trees and destroying them leaves it exactly
+where it started.
 
 The page tables themselves are not checked by booting. `staros-paging` abstracts
 the two things the loader and the kernel do differently — where a table frame

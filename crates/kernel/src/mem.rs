@@ -311,15 +311,46 @@ pub fn with<R>(f: impl FnOnce(&mut FramePool) -> R) -> R {
     f(alloc)
 }
 
+/// Frames handed out by [`alloc_frame`] and not yet returned by [`free_frame`].
+///
+/// Only those two. Anything that reaches the pool through [`with`] — the
+/// multi-frame blocks the self-test below takes — is invisible here, and must
+/// free the same way it allocated.
+///
+/// A ledger the kernel keeps for itself, and it exists because the allocator's
+/// own answer is the wrong shape. [`coalesced_frames`] is the sum over trees of
+/// each tree's *largest free run*: it equals the managed total exactly when the
+/// pool is entirely free and fully coalesced, which makes it a perfect end-of-boot
+/// check and a useless mid-run one. Once anything is held permanently — and from
+/// phase 3.1 something is, the shared tick page — the largest free block has
+/// already been cut, and cutting it again with fourteen more frames may not change
+/// the number at all. Leaking a whole task's page tables went undetected by it.
+///
+/// A count of outstanding frames has no such blind spot: build an address space
+/// and tear it down, and this must return to exactly the value it had.
+static IN_USE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 /// Allocate one frame, or `None` when memory is exhausted.
 pub fn alloc_frame() -> Option<PhysAddr> {
-    with(|a| a.alloc_pages(1))
+    let frame = with(|a| a.alloc_pages(1));
+    if frame.is_some() {
+        IN_USE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+    frame
 }
 
 /// Return a frame to the pool.
 pub fn free_frame(frame: PhysAddr) {
     with(|a| a.free_pages(frame));
+    IN_USE.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
 }
+
+/// How many frames are currently handed out. See [`IN_USE`].
+#[must_use]
+pub fn frames_in_use() -> u64 {
+    IN_USE.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 
 /// The sum, over the pool's trees, of each tree's longest free run.
 ///
@@ -395,7 +426,11 @@ pub fn selftest(console: &mut crate::console::Console) -> bool {
             held.swap(i, j);
         }
         for &block in &held[..n] {
-            free_frame(block);
+            // The pool directly, not `free_frame`: this test takes *blocks* with
+            // `alloc_pages`, which the ledger in `IN_USE` does not see, and a free
+            // it did see would drive the count negative. The two must be symmetric
+            // or the ledger measures the test instead of the kernel.
+            with(|a| a.free_pages(block));
         }
         let after = coalesced_frames();
         if after != before {

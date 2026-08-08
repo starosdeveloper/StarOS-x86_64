@@ -58,6 +58,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use staros_arch_x86_64::context::{self, context_switch, CpuContext};
 use staros_arch_x86_64::{cpu, gdt, syscall};
 
+use crate::addrspace::AddressSpace;
 use crate::console::Console;
 use crate::kprintln;
 use crate::sync::SpinLock;
@@ -108,6 +109,16 @@ struct Task {
     /// address of nothing. It is only ever *used* for a live task, but a field
     /// that is wrong for a dead one is a field waiting to be read by mistake.
     kernel_stack_top: u64,
+    /// The tree this task runs in, as a `CR3` value.
+    ///
+    /// A kernel thread carries the kernel's own root; a ring-3 task carries its
+    /// private one. Phase 2.4 deliberately left this field out, on the grounds
+    /// that a field holding the same value for everyone is a comment. Phase 3.2
+    /// is where it stops being one.
+    cr3: u64,
+    /// The ring-3 address space, if this is a user task. `None` for a kernel
+    /// thread, which runs in the kernel's own tree and owns no user pages.
+    space: Option<AddressSpace>,
     state: State,
     id: usize,
     /// What the boot log calls it. A task is otherwise identified only by a slot
@@ -115,21 +126,60 @@ struct Task {
     name: &'static str,
 }
 
-/// Tell the CPU and the syscall path which kernel stack the running task uses.
+/// The kernel's own `CR3`, recorded the first time [`start`] runs.
 ///
-/// Called on **every** switch into a task, and the two writes are not
-/// interchangeable. `TSS.rsp0` is what the CPU itself loads when an interrupt
-/// arrives while ring 3 is executing — it reads the TSS before a single kernel
-/// instruction runs, so nothing in software can supply it late.
-/// [`syscall::set_kernel_stack`] is what the `syscall` entry stub reads through
-/// `GS`, because `syscall` does not switch stacks at all.
+/// Where a core goes when it has no task: the bootstrap context must not be left
+/// executing in a tree that is about to be torn down.
 ///
-/// Both are set for kernel tasks too, which never make either transition. Setting
-/// them unconditionally costs two stores and means there is no state in which the
-/// answer to "which kernel stack" depends on which kind of task is running.
-fn install_kernel_stack(top: u64) {
-    gdt::set_privilege_stack(top);
-    syscall::set_kernel_stack(top);
+/// Zero is a *legitimate value* here, and finding that out cost an afternoon.
+/// Physical frame 0 is ordinary RAM on a PC, the frame pool hands it out like any
+/// other, and on this machine it is what `vm::init` got for the kernel's PML4 —
+/// so `CR3` is genuinely 0 and the machine runs perfectly. Any code that reads a
+/// zero root as "no root" is therefore wrong, which is why [`enter`] takes an
+/// `Option` and not a sentinel.
+static KERNEL_ROOT: AtomicU64 = AtomicU64::new(0);
+
+/// Make a task's kernel stack and address space current.
+///
+/// `top` is `None` when there is no task — the bootstrap context, which never
+/// takes a ring transition and so has no use for a privilege stack. Leaving the
+/// previous value in place is deliberate: the alternative is writing a null into
+/// `TSS.rsp0`, and a null there is only ever read by a transition that cannot
+/// happen from ring 0.
+///
+/// Called on **every** switch into a task, and none of the three writes is
+/// interchangeable with another:
+///
+/// - `TSS.rsp0` is what the **CPU** loads when an interrupt arrives while ring 3
+///   is executing. It reads the TSS before one kernel instruction runs, so
+///   nothing in software can supply it late.
+/// - [`syscall::set_kernel_stack`] is what the `syscall` entry stub reads through
+///   `GS`, because `syscall` does not switch stacks at all.
+/// - `CR3` is the address space. Written only when it changes, because writing it
+///   flushes every non-global TLB entry and most switches are between tasks in
+///   the same tree.
+///
+/// Both parameters are `Option` rather than sentinel values, because neither zero
+/// nor any other number is available as "leave this alone": physical frame 0 is a
+/// real frame that this pool really hands out, and on this machine the kernel's
+/// own PML4 lives there.
+///
+/// Switching `CR3` here — in kernel code, mid-function — is safe for exactly one
+/// reason: every tree's upper half is the *same* set of tables (see
+/// [`AddressSpace`]), so the instruction after the write, the stack under it and
+/// the console it may print to are mapped identically on both sides.
+fn enter(top: Option<u64>, cr3: Option<u64>) {
+    if let Some(top) = top {
+        gdt::set_privilege_stack(top);
+        syscall::set_kernel_stack(top);
+    }
+    let Some(cr3) = cr3 else { return };
+    if cpu::read_cr3() != cr3 {
+        // SAFETY: `cr3` is a root this kernel built — either `vm::init`'s or an
+        // `AddressSpace`'s — and every one of them carries the kernel's upper
+        // half verbatim, so the code executing this remains mapped across it.
+        unsafe { cpu::write_cr3(cr3) };
+    }
 }
 
 /// Allocate a zeroed kernel stack, or `None` if the heap is exhausted.
@@ -247,6 +297,16 @@ static YIELDS: AtomicU64 = AtomicU64::new(0);
 static REAPED_STACKS: AtomicU64 = AtomicU64::new(0);
 static REAPED_WORDS: AtomicU64 = AtomicU64::new(0);
 
+/// Ring-3 address spaces torn down, and the frames — data pages and page tables
+/// both — that went back to the pool.
+///
+/// The same accounting as the stacks, for the same reason. A task that faults and
+/// dies costs the machine its whole tree; leaving it mapped changes nothing
+/// anybody would notice until the pool runs out, which on a machine with
+/// gigabytes is never during a boot and always during a run.
+static REAPED_SPACES: AtomicU64 = AtomicU64::new(0);
+static REAPED_FRAMES: AtomicU64 = AtomicU64::new(0);
+
 /// Switches performed, how many were preemptions, and how many were voluntary.
 #[must_use]
 pub fn switch_counts() -> (u64, u64, u64) {
@@ -255,6 +315,25 @@ pub fn switch_counts() -> (u64, u64, u64) {
         PREEMPTIONS.load(Ordering::Relaxed),
         YIELDS.load(Ordering::Relaxed),
     )
+}
+
+/// Ring-3 address spaces torn down so far, and the frames that returned.
+#[must_use]
+pub fn reaped_spaces() -> (u64, u64) {
+    (
+        REAPED_SPACES.load(Ordering::Relaxed),
+        REAPED_FRAMES.load(Ordering::Relaxed),
+    )
+}
+
+/// The address space of the running task, if it has one.
+#[must_use]
+pub fn current_space() -> Option<AddressSpace> {
+    let sched = SCHED.lock();
+    if sched.current == NONE {
+        return None;
+    }
+    sched.tasks[sched.current].space
 }
 
 /// Dead-task kernel stacks reaped so far, and the bytes that freed.
@@ -310,6 +389,19 @@ pub fn describe(console: &mut Console) {
 /// Returns `false` if the heap could not supply a stack or a slot — the machine's
 /// answer, not a number chosen in advance.
 pub fn spawn(name: &'static str, entry: extern "C" fn()) -> bool {
+    spawn_with(name, entry, None)
+}
+
+/// Create a **ring-3** task: a kernel thread whose entry drops into `space`.
+///
+/// The task owns the space: when it dies, its successor tears the tree down and
+/// returns every frame (see [`post_switch`]).
+pub fn spawn_user(name: &'static str, entry: extern "C" fn(), space: AddressSpace) -> bool {
+    spawn_with(name, entry, Some(space))
+}
+
+/// The body of both, with the address space as the only difference.
+fn spawn_with(name: &'static str, entry: extern "C" fn(), space: Option<AddressSpace>) -> bool {
     // Point the arch crate's trampoline back at this module. Done here, in the
     // only way a task can come into existence, rather than in an `init` a future
     // caller could forget: the trampoline is unreachable until a task exists, and
@@ -336,6 +428,12 @@ pub fn spawn(name: &'static str, entry: extern "C" fn()) -> bool {
         ctx,
         stack,
         kernel_stack_top,
+        // A user task runs in its own tree; a kernel thread runs in whatever tree
+        // the kernel is in, read now rather than stored once so a spawn before
+        // `vm::init` would be visibly wrong instead of quietly inheriting a root
+        // that does not exist yet.
+        cr3: space.map_or_else(cpu::read_cr3, |s| s.root()),
+        space,
         state: State::Ready,
         id: 0,
         name,
@@ -366,6 +464,10 @@ pub fn start() {
     // resumed by a preemption returns through `iretq`, which restores `IF` from
     // the frame it was interrupted with.
     let saved = unsafe { cpu::irq_save() };
+    // The tree the kernel is in right now. Recorded here because this is the one
+    // place guaranteed to run before any task has switched `CR3` away from it,
+    // and the bootstrap context has to be able to get back.
+    KERNEL_ROOT.store(cpu::read_cr3(), Ordering::SeqCst);
 
     loop {
         let picked = {
@@ -377,22 +479,25 @@ pub fn start() {
                 // nothing for the successor to settle.
                 PREV.store(NONE, Ordering::Relaxed);
                 let top = sched.tasks[first].kernel_stack_top;
+                let cr3 = sched.tasks[first].cr3;
                 let boot: *mut CpuContext = &mut sched.bootstrap;
                 let next: *const CpuContext = &sched.tasks[first].ctx;
-                (boot, next, top)
+                (boot, next, top, cr3)
             })
         };
-        let Some((boot_ptr, next_ptr, top)) = picked else {
+        let Some((boot_ptr, next_ptr, top, cr3)) = picked else {
             break;
         };
-        install_kernel_stack(top);
+        enter(Some(top), Some(cr3));
         SWITCHES.fetch_add(1, Ordering::Relaxed);
         // SAFETY: the two pointers name distinct contexts — the bootstrap's and a
         // task's — the guard has been dropped, and interrupts are masked. We
         // resume here when this core runs out of tasks.
         unsafe { context_switch(boot_ptr, next_ptr) };
-        // Back in the bootstrap context: settle (and, if it exited, reap) the task
-        // that switched back to us.
+        // Back in the bootstrap context, and possibly in a tree that is about to
+        // be freed: return to the kernel's own before anything else runs.
+        enter(None, Some(KERNEL_ROOT.load(Ordering::SeqCst)));
+        // Settle (and, if it exited, reap) the task that switched back to us.
         post_switch();
     }
 
@@ -471,6 +576,7 @@ fn reschedule() -> bool {
     let prev_ptr: *mut CpuContext;
     let next_ptr: *const CpuContext;
     let next_top: u64;
+    let next_cr3: u64;
     {
         let mut sched = SCHED.lock();
         let prev = sched.current;
@@ -492,10 +598,11 @@ fn reschedule() -> bool {
         // stack; `prev` is alive here, so the successor will find nothing to do.
         PREV.store(prev, Ordering::Relaxed);
         next_top = sched.tasks[next].kernel_stack_top;
+        next_cr3 = sched.tasks[next].cr3;
         prev_ptr = &mut sched.tasks[prev].ctx;
         next_ptr = &sched.tasks[next].ctx;
     }
-    install_kernel_stack(next_top);
+    enter(Some(next_top), Some(next_cr3));
     SWITCHES.fetch_add(1, Ordering::Relaxed);
     // SAFETY: `pick_next` never returns `prev`, so the two pointers name distinct
     // contexts; the guard is dropped and interrupts are masked. Execution resumes
@@ -520,6 +627,7 @@ pub fn exit() -> ! {
     let prev_ptr: *mut CpuContext;
     let next_ptr: *const CpuContext;
     let next_top: Option<u64>;
+    let next_cr3: u64;
     {
         let mut sched = SCHED.lock();
         let prev = sched.current;
@@ -531,6 +639,7 @@ pub fn exit() -> ! {
                 sched.tasks[next].state = State::Running;
                 sched.current = next;
                 next_top = Some(sched.tasks[next].kernel_stack_top);
+                next_cr3 = sched.tasks[next].cr3;
                 next_ptr = &sched.tasks[next].ctx;
             }
             // Nothing left to run: back to the bootstrap context, which decides
@@ -541,13 +650,15 @@ pub fn exit() -> ! {
             None => {
                 sched.current = NONE;
                 next_top = None;
+                // Back to the kernel's own tree. This task's is about to be torn
+                // down, and the bootstrap context must not be the thing standing
+                // in it when that happens.
+                next_cr3 = KERNEL_ROOT.load(Ordering::SeqCst);
                 next_ptr = &sched.bootstrap;
             }
         }
     }
-    if let Some(top) = next_top {
-        install_kernel_stack(top);
-    }
+    enter(next_top, Some(next_cr3));
     SWITCHES.fetch_add(1, Ordering::Relaxed);
     // SAFETY: `prev` is a dead slot used only as a write sink for a context
     // nobody will load; `next` is a live context. Interrupts are masked.
@@ -570,11 +681,13 @@ fn post_switch() {
     if prev == NONE {
         return;
     }
-    let _freed = {
+    let (_freed, space) = {
         let mut sched = SCHED.lock();
         // Only a dead slot that still owns a stack is reapable, so a stray double
         // settle can never free the same allocation twice.
-        if sched.tasks[prev].state == State::Dead && !sched.tasks[prev].stack.is_empty() {
+        let stack = if sched.tasks[prev].state == State::Dead
+            && !sched.tasks[prev].stack.is_empty()
+        {
             let old = core::mem::replace(
                 &mut sched.tasks[prev].stack,
                 Vec::<u64>::new().into_boxed_slice(),
@@ -584,9 +697,31 @@ fn post_switch() {
             Some(old)
         } else {
             None
-        }
+        };
+        // `take`, not a copy: a space handed out once can never be torn down
+        // twice, whatever calls this.
+        let space = if sched.tasks[prev].state == State::Dead {
+            sched.tasks[prev].space.take()
+        } else {
+            None
+        };
+        (stack, space)
     };
     // `_freed` drops here, outside the scheduler lock.
+
+    // And the dead task's address space, if it had one. Safe here and nowhere
+    // earlier: the switch that brought this core here has already left that tree
+    // — `enter` reloaded `CR3` before it — so the tables being freed are not the
+    // ones the CPU is walking. Freeing them from inside the dying task would be a
+    // fault with no report.
+    if let Some(space) = space {
+        // SAFETY: this core is no longer in that tree (see above), the space was
+        // taken from the slot so nothing else holds it, and every frame it owns
+        // came from `mem::alloc_frame` through its own mapping calls.
+        let frames = unsafe { space.destroy() };
+        REAPED_SPACES.fetch_add(1, Ordering::Relaxed);
+        REAPED_FRAMES.fetch_add(frames as u64, Ordering::Relaxed);
+    }
 }
 
 // ---------------------------------------------------------------------------

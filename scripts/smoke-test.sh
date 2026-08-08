@@ -267,15 +267,39 @@ expect "$L" "syscall was enabled and pointed at the kernel" \
 # interrupt on the user stack, a user debugger stepping the kernel, and ring 3
 # switching SMAP off for the kernel's duration.
 expect "$L" "fmask clears IF, TF and AC" 'fmask 0x54700'
-expect "$L" "three user pages with three different rights" \
-    'user: [0-9]+ byte program at 0x400000 r-x, stack 0x7ffff000 rw-, clock 0x410000 r--'
+# --- phase 3.2: address spaces and the ELF loader --------------------------
+# A real, separately linked executable, parsed rather than assembled here: two
+# PT_LOAD segments with different rights, and an entry point read out of the
+# image. One segment would mean the loader was never asked to apply two.
+expect "$L" "a real ELF was parsed, not a blob" \
+    'user: image [0-9]+ bytes, entry 0x400000, 2 loadable segment\(s\)'
+# The sentence this phase is about. Two CR3 values is not isolation; two
+# *different physical frames* for one virtual address is.
+expect "$L" "the same address resolves differently in the two spaces" \
+    'user: two spaces, cr3 0x[0-9a-f]+ and 0x[0-9a-f]+; 0x400000 -> 0x[0-9a-f]+ and 0x[0-9a-f]+'
 # Ring 3 ran at all: iretq lowered the privilege level, `syscall` was a valid
-# opcode, LSTAR pointed at the stub, and sysretq came back.
-expect "$L" "ring 3 executed and its output arrived" 'user: hello from ring 3'
-expect "$L" "it came back from a voluntary yield" \
-    'user: preempted while in ring 3, yielded, and came back'
+# opcode, LSTAR pointed at the stub, and sysretq came back. Both lines are the
+# *same instruction* in the *same image* at the *same address* printing a
+# different digit, because the page under it differs - and the digit is stamped
+# in at run time, so the writable segment is writable and private too.
+expect "$L" "the first program ran and knew its own id"  'user 1: running at 0x400000 in its own address space'
+expect "$L" "the second ran in its own space"            'user 2: running at 0x400000 in its own address space'
+# The criterion: a fault kills the task that took it and nothing else. The
+# surviving task's last line cannot exist unless it outlived its neighbour.
+expect "$L" "the second faulted where nothing is mapped" \
+    'user fault: task "U2" took vector 14 - #PF page fault in ring 3'
+expect "$L" "and it faulted at address zero"             '#PF at 0x0: read from an unmapped page'
+expect "$L" "the first outlived it"                      'user 1: still running after its neighbour faulted'
+# A program that reported dirty .bss would mean the loader handed over whatever
+# the frame last held - which on a running machine is another task's data.
+forbid "$L" "the zero-filled tail arrived dirty"         'BSS ARRIVED DIRTY'
 expect "$L" "the syscalls it made were all understood" \
-    'user: 4 syscalls served \(0 refused\), 80 bytes written, 1 voluntary switch\(es\)'
+    'user: 6 syscalls served \(0 refused\), 216 bytes written, 1 Yield call\(s\)'
+# Both trees came back, whole. A dead task's page tables leaking changes nothing
+# anybody would notice until the pool runs out, so the pool is required to be
+# exactly where it started - not approximately.
+expect "$L" "both address spaces were torn down and every frame came back" \
+    'user: 2 address space\(s\) torn down, [0-9]+ frames returned; ([0-9]+) -> \1 frames still out'
 # The one thing only ring 3 can demonstrate. An interrupt taken in ring 0
 # changes no stack, so a kernel task being preempted says nothing about rsp0;
 # an interrupt taken in ring 3 has the CPU load TSS.rsp0 before a single kernel
@@ -293,11 +317,12 @@ expect "$L" "and it faulted at the address that was forced" \
     'RIP=0x0000800000000000 CS=0x002b'
 expect "$L" "only the task died"             'killing the task; the kernel continues'
 expect "$L" "the return took the slow path deliberately" 'sysret: [1-9][0-9]* return\(s\) went out through iretq instead'
+expect "$L" "and the killed task's tree came back too"   'killed only that task, and its [0-9]+ frames came back'
 forbid "$L" "a fault from ring 3 reached the fatal path" 'KERNEL FAULT: vector 13'
 
 forbid "$L" "a self-test reported failure"   'SELF-TEST FAILED|did not converge|self-test FAILED'
 forbid "$L" "a phase was claimed after a failure" 'not claiming phase'
-expect "$L" "boot reached the end of phase 3.1" 'phase 3.1 complete'
+expect "$L" "boot reached the end of phase 3.2" 'phase 3.2 complete'
 
 # The last act: a deliberate stack overflow. Without a TSS, an IST and a #DF
 # gate this is a triple fault and the log simply stops - which is exactly what
