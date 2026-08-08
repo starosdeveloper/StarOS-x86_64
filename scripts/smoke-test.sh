@@ -227,9 +227,38 @@ expect "$L" "the timer runs periodically on its own vector" \
 expect "$L" "a hundred ticks at 100 Hz took a second by the HPET" \
     'timer: 100 interrupts at 100 Hz took (0\.9[89][0-9]|1\.0[01][0-9]) s by the HPET \([01]\.[0-9]% off, tolerance 2%\)'
 
+# --- phase 2.4: two tasks, and a timer that takes the CPU away -------------
+# Neither task yields. Every switch between them is one the timer forced, which
+# is what makes the interleaving evidence rather than decoration.
+expect "$L" "two kernel threads were created" \
+    'sched: 2 tasks, 32 KiB of kernel stack each, round robin'
+expect "$L" "the timer was left running to drive them" \
+    'sched: preempting at 100 Hz'
+expect "$L" "both tasks reached the end of their body" \
+    'sched: [0-9]+ switches \([1-9][0-9]* forced by the timer\), 2 of 2 tasks finished'
+# The criterion. Two tasks that never yield both finish whether or not
+# preemption works - one strictly after the other, if it does not. What only
+# preemption produces is each of them *observing the other advance while it was
+# running*, and both counts have to be non-zero: one alone would be a task that
+# started late and watched a finished peer.
+expect "$L" "the tasks genuinely interleaved" \
+    'sched: A took [0-9]+ steps and saw B move [1-9][0-9]* times; B took [0-9]+ steps and saw A move [1-9][0-9]* times'
+# A task cannot free the stack it is standing on, so its successor does it. Miss
+# that and every kernel thread leaks 32 KiB until reboot, silently.
+expect "$L" "both dead stacks came back to the heap" \
+    'sched: 2 dead stacks reaped, 64 KiB returned to the heap'
+expect "$L" "task A ended dead with its stack reclaimed" \
+    'sched: task 0 "A" dead, 0 KiB of stack \(reclaimed\)'
+expect "$L" "task B ended dead with its stack reclaimed" \
+    'sched: task 1 "B" dead, 0 KiB of stack \(reclaimed\)'
+# The console lock, held for a whole message. Two tasks print while the timer
+# preempts them; without the lock the lines come out shredded into each other,
+# so a task line that does not start at the beginning of a line is the failure.
+forbid "$L" "a task's line was cut into another's" 'task [AB]: [0-9]+ ticks in, [0-9]+ steps, saw the other move [0-9]+ times.+task [AB]:'
+
 forbid "$L" "a self-test reported failure"   'SELF-TEST FAILED|did not converge|self-test FAILED'
 forbid "$L" "a phase was claimed after a failure" 'not claiming phase'
-expect "$L" "boot reached the end of phase 2.3" 'phase 2.3 complete'
+expect "$L" "boot reached the end of phase 2.4" 'phase 2.4 complete'
 
 # The last act: a deliberate stack overflow. Without a TSS, an IST and a #DF
 # gate this is a triple fault and the log simply stops - which is exactly what

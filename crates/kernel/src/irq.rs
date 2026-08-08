@@ -170,6 +170,72 @@ static APIC_SPURIOUS: AtomicU64 = AtomicU64::new(0);
 /// Timer ticks seen since the PIT was started.
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
+/// The local APIC timer reload the calibration produced, for [`TIMER_HZ`].
+///
+/// Kept so the timer can be restarted later at the rate it was *measured* at
+/// rather than at a rate recomputed from a number that has since been rounded.
+/// Zero until [`selftest_timer`] has run.
+static TIMER_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Timer ticks counted so far.
+///
+/// Monotonic from the first tick the kernel ever took, and the only measure of
+/// elapsed time available to code that must not block — the HPET is behind a
+/// lock, and a task cannot take it while another task holds it.
+#[must_use]
+pub fn ticks() -> u64 {
+    TICKS.load(Ordering::Relaxed)
+}
+
+/// Start the periodic timer at [`TIMER_HZ`] and leave it running, with
+/// interrupts enabled.
+///
+/// The scheduler's heartbeat. Everything before phase 2.4 started the timer for
+/// the length of one measurement and stopped it again; this is the first time it
+/// is turned on and left on, because it now drives something.
+///
+/// Returns the rate it is running at.
+///
+/// # Errors
+/// When the timer has not been calibrated, which means nothing knows how many
+/// ticks a second is.
+///
+/// # Safety
+/// Called on the boot core with the APICs up and the IDT installed. Enables
+/// interrupts, so the caller must be ready to be preempted.
+pub unsafe fn start_ticking() -> Result<u32, &'static str> {
+    let count = TIMER_COUNT.load(Ordering::SeqCst);
+    if count == 0 {
+        return Err("the timer has not been calibrated");
+    }
+    TIMER_VECTOR.store(LAPIC_TIMER_VECTOR, Ordering::SeqCst);
+    {
+        let mut slot = LAPIC.lock();
+        let Some(lapic) = slot.as_mut() else {
+            return Err("the local APIC is not up");
+        };
+        lapic.start_timer_periodic(LAPIC_TIMER_VECTOR, count);
+    }
+    // SAFETY: the IDT is installed, the 8259s are masked for good, the local APIC
+    // is enabled with a spurious vector this kernel recognises, and the only
+    // source armed is the timer just programmed.
+    unsafe { cpu::enable_interrupts() };
+    Ok(TIMER_HZ)
+}
+
+/// Stop the periodic timer and mask interrupts again.
+///
+/// # Safety
+/// Called on the boot core. Leaves the core unable to be preempted, so anything
+/// still expecting to be scheduled will not be.
+pub unsafe fn stop_ticking() {
+    // SAFETY: forwarded from this function's contract.
+    unsafe { cpu::disable_interrupts() };
+    if let Some(lapic) = LAPIC.lock().as_mut() {
+        lapic.stop_timer();
+    }
+}
+
 /// Interrupts that arrived on a line nothing had asked for.
 static UNEXPECTED: AtomicU64 = AtomicU64::new(0);
 
@@ -224,6 +290,17 @@ pub fn dispatch(frame: &TrapFrame) {
     } else {
         dispatch_pic(frame);
     }
+    // The epilogue, and it runs *after* the acknowledgement above for a reason
+    // that is not tidiness. `on_irq_epilogue` may switch tasks, and a switch does
+    // not return until this task is scheduled again — so an EOI placed after it
+    // would leave the interrupt in service for as long as the task is off the
+    // CPU, which on a periodic timer means for good.
+    //
+    // It is also outside both `dispatch_pic` and `dispatch_apic`, and outside
+    // whatever locks they took: `reschedule` takes the scheduler lock, and
+    // holding a controller's lock across that would nest two locks in an order
+    // nothing else uses.
+    crate::sched::on_irq_epilogue();
 }
 
 /// The 8259 path.
@@ -274,6 +351,10 @@ fn dispatch_apic(frame: &TrapFrame) {
 
     if vector == TIMER_VECTOR.load(Ordering::Relaxed) {
         TICKS.fetch_add(1, Ordering::Relaxed);
+        // Ask for a reschedule; do not perform one. The interrupt has not been
+        // acknowledged yet and the trap frame is only half unwound, so this
+        // records the request and `dispatch` acts on it once both are settled.
+        crate::sched::request_resched();
     } else {
         UNEXPECTED.fetch_add(1, Ordering::Relaxed);
     }
@@ -712,6 +793,10 @@ pub unsafe fn selftest_timer(console: &mut Console, ticks_per_second: u64) -> bo
 
     TIMER_VECTOR.store(LAPIC_TIMER_VECTOR, Ordering::SeqCst);
     TICKS.store(0, Ordering::SeqCst);
+    // Keep the reload the calibration produced. Phase 2.4 restarts the timer with
+    // it, and recomputing it there from a rate that has since been printed and
+    // rounded would be a second answer to a question already answered.
+    TIMER_COUNT.store(count, Ordering::SeqCst);
 
     let start = {
         let mut slot = HPET.lock();
@@ -761,8 +846,8 @@ pub unsafe fn selftest_timer(console: &mut Console, ticks_per_second: u64) -> bo
         core::hint::spin_loop();
     }
 
-    // SAFETY: nothing after this expects to be interrupted; phase 2.4 is what
-    // gives the ticks something to do.
+    // SAFETY: the measurement is over. `start_ticking` turns the timer back on
+    // for good, once there is a scheduler for the ticks to drive.
     unsafe { cpu::disable_interrupts() };
     let end = HPET.lock().as_mut().map_or(start, Hpet::now);
     if let Some(lapic) = LAPIC.lock().as_mut() {

@@ -97,14 +97,17 @@ fn on_trap(frame: &mut TrapFrame) {
         return;
     }
 
-    // SAFETY: single core, and a trap suspends whatever else held the console.
-    // See `console`'s module documentation.
-    let Some(console) = (unsafe { console::get() }) else {
+    let Some(mut handle) = console::get() else {
         // A trap between `lidt` and the console existing. There is nowhere to
         // say so, and continuing would be a guess.
         cpu::halt()
     };
+    let console = &mut handle;
 
+    // The two survivable paths print through the ordinary, locked console: they
+    // return to the code that was interrupted, so their lines have to take their
+    // turn like anyone else's. Both run during a self-test on the boot path,
+    // where nothing else is printing anyway.
     if resume_if_expected(console, frame, faulting_address) {
         return;
     }
@@ -113,7 +116,7 @@ fn on_trap(frame: &mut TrapFrame) {
         return;
     }
 
-    report(console, frame, faulting_address);
+    report(frame, faulting_address);
     cpu::halt()
 }
 
@@ -153,7 +156,16 @@ fn resume_if_expected(console: &mut Console, frame: &mut TrapFrame, address: u64
 }
 
 /// Print everything known about a fault that ends the boot.
-fn report(console: &mut Console, frame: &TrapFrame, address: u64) {
+///
+/// Through [`console::emergency`], not the ordinary console. This report is the
+/// last thing this core will print, and the code it interrupted may be holding
+/// the console lock — waiting for a lock whose holder is never going to run again
+/// would eat exactly the message worth keeping. See `console`'s module docs.
+fn report(frame: &TrapFrame, address: u64) {
+    // SAFETY: a trap has suspended every other writer on this core, and this
+    // kernel has one core. Nothing after this call runs.
+    let mut console = unsafe { console::emergency() };
+    let console = &mut console;
     console.set_alert(true);
     let _ = writeln!(
         console,

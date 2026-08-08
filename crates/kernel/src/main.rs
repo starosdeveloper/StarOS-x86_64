@@ -4,21 +4,39 @@
 //! [`BootInfo`] in `RDI`, after `ExitBootServices`: the firmware is gone, this
 //! code owns the machine, and nothing is set up that the loader did not set up.
 //!
-//! What runs today is the first links of the chain — take the kernel's own
-//! stack, validate the hand-off, bring up whatever console exists, install the
-//! CPU tables, and prove they work by faulting on purpose. Each following stage
-//! is specified in `docs/SPEC.md` and sequenced in `docs/ROADMAP.md`; they are
-//! absent here rather than stubbed, so the boot log cannot claim a subsystem
-//! that has not been written.
+//! What runs today is phases 1 and 2 of `docs/ROADMAP.md` — take the kernel's
+//! own stack, validate the hand-off, bring up whatever console exists, install
+//! the CPU tables, take ownership of memory, build the kernel's own page tables,
+//! move the 8259s, bring up the APICs, calibrate a timer against the HPET, and
+//! run two kernel threads under preemption. Every one of those is followed by a
+//! self-test that can fail, because the alternative — a table that is subtly
+//! wrong — is completely silent.
+//!
+//! The order below is not a preference. Each stage is the first thing able to
+//! report the next stage's failure: the console before the CPU tables, the CPU
+//! tables before anything that can fault, memory before the page tables, the page
+//! tables before any device mapping, the interrupt controller before the clock,
+//! the clock before the scheduler.
+//!
+//! Everything after this is specified in `docs/SPEC.md` and sequenced in
+//! `docs/ROADMAP.md`; those stages are absent here rather than stubbed, so the
+//! boot log cannot claim a subsystem that has not been written.
 
 #![no_std]
 #![no_main]
+
+// The scheduler allocates: a task's stack and its slot both come from the heap,
+// because both are sized by the machine rather than by a number picked in
+// advance. `heap` has provided the global allocator since phase 1.4; phase 2.4 is
+// the first code to need the collections that sit on top of it.
+extern crate alloc;
 
 mod acpi;
 mod console;
 mod heap;
 mod irq;
 mod mem;
+mod sched;
 mod sync;
 mod traps;
 mod vm;
@@ -90,7 +108,11 @@ unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
     // case that needs to be reported.
     // SAFETY: first code to run after the loader; nothing else drives COM1, and
     // this is the only initialisation.
-    let console = unsafe { console::init() };
+    //
+    // The handle is zero-sized and the device is behind a lock (see `console`),
+    // so this borrow costs nothing and takes nothing away from the trap handler,
+    // which makes its own handle when it needs one.
+    let console = &mut (unsafe { console::init() });
 
     let _ = writeln!(console, "\nSTAR OS microkernel (x86_64) v{}", env!("CARGO_PKG_VERSION"));
 
@@ -306,7 +328,18 @@ unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
                     // SAFETY: the APICs are up, interrupts are masked, tables live.
                     match unsafe { irq::init_timer(console, &tables, &facts) } {
                         // SAFETY: the timer is calibrated and stopped.
-                        Ok(rate) => ok &= unsafe { irq::selftest_timer(console, rate) },
+                        Ok(rate) => {
+                            // SAFETY: the timer is calibrated and stopped.
+                            ok &= unsafe { irq::selftest_timer(console, rate) };
+
+                            // And something for the ticks to do. Until now every
+                            // tick was counted and discarded; from here one of
+                            // them can take the CPU away from whoever has it.
+                            //
+                            // SAFETY: the timer is calibrated, the APICs are up
+                            // and the IDT is installed. Runs once.
+                            ok &= unsafe { sched::selftest(console) };
+                        }
                         Err(e) => {
                             let _ = writeln!(console, "timer SELF-TEST FAILED: {e}");
                             ok = false;
@@ -332,12 +365,12 @@ unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
     // that prints "complete" after a failed self-test is worse than one that
     // prints nothing: it is the line a later reader will trust.
     if !ok {
-        let _ = writeln!(console, "a self-test failed; not claiming phase 2.3. Halting.");
+        let _ = writeln!(console, "a self-test failed; not claiming phase 2.4. Halting.");
         cpu::halt()
     }
     let _ = writeln!(
         console,
-        "phase 2.3 complete: the kernel has a clock, and knows how fast it runs."
+        "phase 2.4 complete: two tasks shared the CPU, and neither one asked to."
     );
 
     // And one that does not come back. Last, deliberately: it is the only proof

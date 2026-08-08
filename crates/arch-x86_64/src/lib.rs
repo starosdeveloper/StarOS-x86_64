@@ -27,13 +27,16 @@
 //!   the 8259s, and the place the HAL's interrupt trait had to be reshaped.
 //! - [`hpet`] — the one clock on the machine that states its own frequency, and
 //!   therefore the ruler every other clock is cut against.
+//! - [`context`] — the six callee-saved registers a task switch has to keep, and
+//!   the first stack frame a task that has never run needs in order to start.
 //! - [`selftest`] — faults taken on purpose, because a correct IDT and a subtly
 //!   wrong one are both silent until something faults.
 //!
-//! Everything else the port needs — APIC, SMP, syscall entry — is scheduled in
-//! `docs/ROADMAP.md` and specified in `docs/SPEC.md`. They are listed there
-//! rather than stubbed here: an empty function that returns `Ok` is worse than
-//! an absent one, because the boot log then claims a subsystem came up.
+//! Everything else the port needs — `syscall`/`sysret` entry, per-task address
+//! spaces, the SMP trampoline — is scheduled in `docs/ROADMAP.md` and specified
+//! in `docs/SPEC.md`. They are listed there rather than stubbed here: an empty
+//! function that returns `Ok` is worse than an absent one, because the boot log
+//! then claims a subsystem came up.
 //!
 //! ## Why this crate has host tests
 //! Most of it cannot have any — `lgdt` does nothing observable off a CPU. But
@@ -53,6 +56,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod apic;
+pub mod context;
 pub mod cpu;
 pub mod gdt;
 pub mod hpet;

@@ -130,7 +130,17 @@ reached_the_end() {
     expect "$log" "the APIC timer was calibrated" 'lapic timer: [0-9]+ ticks/s at divisor 16'
     expect "$log" "a second measured as a second" \
         'timer: 100 interrupts at 100 Hz took (0\.9[89][0-9]|1\.0[01][0-9]) s by the HPET'
-    expect "$log" "the boot claimed the phase" 'phase 2.3 complete'
+    # And two tasks sharing that clock's ticks. The step counts are properties of
+    # the machine's speed and are not asserted; what is asserted is that both
+    # tasks finished, that the timer forced the switches, that each saw the other
+    # advance while it was running, and that both stacks came back.
+    expect "$log" "both tasks finished under preemption" \
+        'sched: [0-9]+ switches \([1-9][0-9]* forced by the timer\), 2 of 2 tasks finished'
+    expect "$log" "the tasks interleaved" \
+        'saw B move [1-9][0-9]* times; B took [0-9]+ steps and saw A move [1-9][0-9]* times'
+    expect "$log" "dead stacks were reclaimed" \
+        'sched: 2 dead stacks reaped, 64 KiB returned to the heap'
+    expect "$log" "the boot claimed the phase" 'phase 2.4 complete'
     forbid "$log" "a self-test failed"         'SELF-TEST FAILED|not claiming phase'
     forbid "$log" "the loader gave up"         'BOOT FAILED'
     forbid "$log" "a panic"                    'KERNEL PANIC'

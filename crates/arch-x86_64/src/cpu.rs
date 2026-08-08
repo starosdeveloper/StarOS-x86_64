@@ -37,6 +37,31 @@ pub unsafe fn enable_interrupts() {
     unsafe { asm!("sti", options(nomem, nostack, preserves_flags)) };
 }
 
+/// Sleep this core until an interrupt arrives, then return with interrupts
+/// masked again.
+///
+/// `sti; hlt` is one instruction pair for a reason that is not style: `sti` does
+/// not take effect until *after* the instruction that follows it, precisely so
+/// that this sequence cannot lose a wakeup. Written as `sti` then a separate
+/// `hlt`, an interrupt arriving in between would be serviced and the core would
+/// then halt with nothing left to wake it — the classic idle-loop hang. The
+/// architecture closes the window; splitting the pair reopens it.
+///
+/// The `cli` afterwards restores the mask, so a caller inside an interrupt-masked
+/// critical section — which every scheduler idle loop is — comes back to the
+/// state it was in.
+///
+/// # Safety
+/// Only valid with an IDT installed and something able to raise an interrupt;
+/// otherwise this halts forever. Unmasks interrupts for the duration, so the
+/// caller's masked section is briefly open.
+#[inline]
+pub unsafe fn wait_for_interrupt() {
+    // SAFETY: forwarded from this function's contract. `nostack` holds: neither
+    // instruction touches memory.
+    unsafe { asm!("sti; hlt; cli", options(nomem, nostack, preserves_flags)) };
+}
+
 /// Whether interrupts are currently unmasked, from `RFLAGS.IF` (bit 9).
 #[must_use]
 pub fn interrupts_enabled() -> bool {

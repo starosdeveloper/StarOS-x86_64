@@ -30,12 +30,12 @@ cargo kbuild        # kernel ELF   -> x86_64-unknown-none
 cargo kloader       # loader EFI   -> x86_64-unknown-uefi
 cargo kclippy       # clippy, kernel
 cargo kloader-clippy
-cargo ktest-host    # the crates this tree owns (173 tests)
+cargo ktest-host    # the crates this tree owns (181 tests)
 
 ./scripts/mkesp.sh       # build both halves, stage an ESP layout
 ./scripts/run-qemu.sh    # boot it: OVMF -> BOOTX64.EFI -> kernel
-./scripts/smoke-test.sh  # boot it and assert on the output (79 assertions)
-./scripts/boot-matrix.sh # boot it on six other machines (147 assertions)
+./scripts/smoke-test.sh  # boot it and assert on the output (87 assertions)
+./scripts/boot-matrix.sh # boot it on six other machines (168 assertions)
 ```
 
 Shared crates are tested in `../kernel-new` (`cargo ktest-host` there), so their
@@ -46,7 +46,7 @@ partition; `run-qemu.sh --debug` starts stopped with a gdb stub on `:1234`.
 
 ## Status
 
-**Phase 1 complete, and phase 2 through 2.3, verified on live firmware.** OVMF
+**Phase 1 and phase 2 complete, verified on live firmware.** OVMF
 finds `EFI/BOOT/BOOTX64.EFI`; the loader collects the RSDP, the GOP framebuffer,
 the kernel and an optional initramfs off the ESP it was itself loaded from, places
 the `PT_LOAD` segments with their own rights (W^X), builds identity, linear and
@@ -55,10 +55,11 @@ the specification requires, and jumps to `_start` with `BootInfo` in `RDI`. The
 kernel takes its own stack, validates the hand-off, mirrors every message to COM1
 and the screen, installs its own GDT, TSS and IDT, takes ownership of physical
 memory, builds its own page tables, moves the 8259s off the CPU's exception
-vectors, reads the interrupt topology out of ACPI, brings up the APICs, and
-calibrates its own timer against the HPET — and proves each of those by faulting,
-interrupting or measuring on purpose, because a correct table and a subtly wrong
-one are both completely silent until something happens.
+vectors, reads the interrupt topology out of ACPI, brings up the APICs,
+calibrates its own timer against the HPET, and runs two kernel threads that share
+the CPU without either of them asking to — and proves each of those by faulting,
+interrupting, measuring or preempting on purpose, because a correct table and a
+subtly wrong one are both completely silent until something happens.
 
 ```
 STAR OS microkernel (x86_64) v0.1.0
@@ -94,7 +95,16 @@ hpet: 100000000 Hz (10000000 fs per tick), 3 comparators, 64-bit counter, vendor
 lapic timer: 62483087 ticks/s at divisor 16, measured over 20 ms of HPET
 lapic timer: periodic, 624830 ticks per interrupt on vector 49 (100 Hz nominal)
 timer: 100 interrupts at 100 Hz took 1.000 s by the HPET (0.0% off, tolerance 2%)
-phase 2.3 complete: the kernel has a clock, and knows how fast it runs.
+sched: 2 tasks, 32 KiB of kernel stack each, round robin
+sched: preempting at 100 Hz, each task runs for 30 ticks and exits
+task A: 10 ticks in, 291584 steps, saw the other move 5 times
+task B: 10 ticks in, 310039 steps, saw the other move 5 times
+task A: done after 845497 steps
+task B: done after 917498 steps
+sched: 33 switches (30 forced by the timer), 2 of 2 tasks finished
+sched: A took 845497 steps and saw B move 14 times; B took 917498 steps and saw A move 14 times
+sched: 2 dead stacks reaped, 64 KiB returned to the heap
+phase 2.4 complete: two tasks shared the CPU, and neither one asked to.
 
 KERNEL FAULT: vector 8 - #DF double fault
   the first fault was at 0xffffffff80043f68
@@ -163,6 +173,36 @@ reserved and divide-by-one sits *past* the whole range — still produces a time
 that ticks perfectly steadily, forever, at the wrong rate. Only a second clock can
 tell. Making `ticks_to_ns` divide by a thousand instead of a million reports the
 error as 6036%, and the boot declines to claim the phase.
+
+The two tasks at the end are a different question again, and the interesting part
+is what the obvious criterion would have missed. Neither task yields — they spin,
+count, and exit after thirty ticks — so **both of them finish whether or not
+preemption works**, one strictly after the other if it does not. "Two of two tasks
+finished" is therefore not evidence of anything. What only preemption can produce
+is each task *observing the other advance while it was itself running*: that
+requires the other to have run in between, and nothing in either body asked for
+it. Both counts have to be non-zero, since one alone would just be a task that
+started late and looked at a finished neighbour. Deleting the one line that asks
+for a reschedule from the timer tick leaves the log reporting two finished tasks,
+three switches, and `saw the other move 0 times` — a pass under the naive
+criterion and a failure under this one.
+
+Starting a task at all is where x86 differs from the sibling tree in the one way
+that is not a simplification. Six callee-saved registers instead of nineteen is
+genuinely less work; but AArch64 has a link register, so bootstrapping a task
+there means writing the trampoline's address into the saved `x30`. Here `ret`
+takes its target off the stack, so the task's first frame has to be *built* —
+which makes the alignment the System V ABI requires something the code must
+establish rather than inherit, and makes a mistake in it wait silently for the
+first `movaps` some unrelated code grows a local wide enough to need. That word is
+placed by a function with no `unsafe` in it and seven host tests around it.
+
+The 64 KiB on the last line is the check that would have been easiest to leave
+out. A task cannot free the stack it is standing on, so its successor does it, and
+the successor is not obviously anyone's responsibility. Removing that hand-off
+changes nothing anyone would notice: thirty preemptions, perfect interleaving,
+both tasks finished, every other assertion green — and 64 KiB gone until reboot.
+The only way to see it is to require that what was created came back.
 
 The page tables themselves are not checked by booting. `staros-paging` abstracts
 the two things the loader and the kernel do differently — where a table frame
