@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Boot STAR OS under OVMF and assert on what comes out.
 #
-# The counterpart to ../kernel-new/scripts/smoke-test.sh, and the same discipline:
+# The counterpart to ../kernel-Aarch64/scripts/smoke-test.sh, and the same discipline:
 # assert on the lines that must appear *and* on the ones that must not, then
 # deliberately break the input and check that the failure is named correctly.
 # A loader that only ever runs against a good kernel is a loader whose error
@@ -352,14 +352,14 @@ forbid "$L" "doubled output (console driven twice)" 'acpi: rsdp at acpi:'
 
 # --------------------------------------------------------------------------
 echo "==> [wrong arch] the aarch64 kernel on a PC's ESP"
-AARCH64="../kernel-new/target/aarch64-unknown-none/debug/kernel"
+AARCH64="../kernel-Aarch64/target/aarch64-unknown-none/debug/kernel"
 if [ -f "$AARCH64" ]; then
     cp "$AARCH64" target/esp/staros/kernel
     boot "$LOG_DIR/arch.log"
     expect "$LOG_DIR/arch.log" "wrong machine is named, not just refused" 'BOOT FAILED: wrong machine'
     forbid "$LOG_DIR/arch.log" "kernel entered anyway" 'STAR OS microkernel'
 else
-    echo "  skipped: build ../kernel-new first (cargo kbuild there) to cover this"
+    echo "  skipped: build ../kernel-Aarch64 first (cargo kbuild there) to cover this"
 fi
 
 # --------------------------------------------------------------------------

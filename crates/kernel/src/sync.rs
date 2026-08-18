@@ -1,6 +1,6 @@
 //! The lock, arriving one architecture later than it did on aarch64.
 //!
-//! The counterpart of `../../../kernel-new/crates/kernel/src/sync.rs`, and the
+//! The counterpart of `../../../kernel-Aarch64/crates/kernel/src/sync.rs`, and the
 //! same ticket lock for the same two reasons — fairness under contention, and
 //! the fact that a lock an interrupt handler may touch has to be taken with
 //! interrupts masked or a single core deadlocks against itself.

@@ -1,10 +1,10 @@
 # STAR OS Kernel — PC (x86_64)
 
-The same microkernel as [`../kernel-new`](../kernel-new), on an ordinary PC.
+The same microkernel as [`../kernel-Aarch64`](../kernel-Aarch64), on an ordinary PC.
 
 Not a fork. The portable half — `abi`, `hal`, `mm`, `ipc`, `cpio`,
 `framebuffer`, `drivers` — is the **same code**, addressed by path into
-`../kernel-new/crates`. A second architecture is the only honest test of whether
+`../kernel-Aarch64/crates`. A second architecture is the only honest test of whether
 the HAL boundary is real, and a copy would fail that test on day one by letting
 the two drift.
 
@@ -39,7 +39,7 @@ cargo ktest-host    # the crates this tree owns (192 tests)
 ./scripts/boot-matrix.sh # boot it on six other machines (224 assertions)
 ```
 
-Shared crates are tested in `../kernel-new` (`cargo ktest-host` there), so their
+Shared crates are tested in `../kernel-Aarch64` (`cargo ktest-host` there), so their
 102 tests are not duplicated here.
 
 `mkesp.sh --to /path/to/mounted/esp` writes the same layout onto a real EFI

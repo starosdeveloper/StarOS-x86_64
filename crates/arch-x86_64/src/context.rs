@@ -1,6 +1,6 @@
 //! Context switching between kernel tasks.
 //!
-//! The counterpart of `../../../kernel-new/crates/arch-aarch64/src/context.rs`,
+//! The counterpart of `../../../kernel-Aarch64/crates/arch-aarch64/src/context.rs`,
 //! and the one place in phase 2 where x86_64 is the *simpler* architecture: a
 //! switch happens at an ordinary function-call boundary, so only the callee-saved
 //! registers have to be saved, and System V names six of them — `RBX`, `RBP`,
