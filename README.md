@@ -13,6 +13,7 @@ the two drift.
 | Crate | Role |
 |-------|------|
 | `crates/acpi` | ACPI tables — the PC's device tree. RSDP, XSDT/RSDT, MADT, MCFG, HPET. No MMIO, no AML |
+| `crates/kernel/src/{obj,cap,ipc}.rs` | The authority model: a global object table with generational revocation, a capability table per task, and endpoints with bounded rings and wait queues |
 | `crates/bootinfo` | The loader → kernel hand-off contract: memory map, framebuffer, RSDP, initramfs, and the address-space layout both binaries agree on |
 | `crates/elf64` | ELF64 program headers. Two users: the loader reading the kernel image, and the kernel reading a ring-3 program |
 | `crates/boot-uefi` | The UEFI loader: firmware bindings, ESP access, page tables, `ExitBootServices` |
@@ -35,8 +36,8 @@ cargo ktest-host    # the crates this tree owns (192 tests)
 
 ./scripts/mkesp.sh       # build both halves, stage an ESP layout
 ./scripts/run-qemu.sh    # boot it: OVMF -> BOOTX64.EFI -> kernel
-./scripts/smoke-test.sh  # boot it and assert on the output (106 assertions)
-./scripts/boot-matrix.sh # boot it on six other machines (224 assertions)
+./scripts/smoke-test.sh  # boot it and assert on the output (129 assertions)
+./scripts/boot-matrix.sh # boot it on six other machines (259 assertions)
 ```
 
 Shared crates are tested in `../kernel-Aarch64` (`cargo ktest-host` there), so their
@@ -47,7 +48,7 @@ partition; `run-qemu.sh --debug` starts stopped with a gdb stub on `:1234`.
 
 ## Status
 
-**Phases 1 and 2 complete, and phase 3 through 3.2, verified on live firmware.** OVMF
+**Phases 1 and 2 complete, and phase 3 through 3.3, verified on live firmware.** OVMF
 finds `EFI/BOOT/BOOTX64.EFI`; the loader collects the RSDP, the GOP framebuffer,
 the kernel and an optional initramfs off the ESP it was itself loaded from, places
 the `PT_LOAD` segments with their own rights (W^X), builds identity, linear and
@@ -58,10 +59,14 @@ and the screen, installs its own GDT, TSS and IDT, takes ownership of physical
 memory, builds its own page tables, moves the 8259s off the CPU's exception
 vectors, reads the interrupt topology out of ACPI, brings up the APICs,
 calibrates its own timer against the HPET, runs two kernel threads that share the
-CPU without either of them asking to, and loads a separately linked ELF into two
-private address spaces and runs it in ring 3 — and proves each of those by
-faulting, interrupting, measuring or preempting on purpose, because a correct
-table and a subtly wrong one are both completely silent until something happens.
+CPU without either of them asking to, loads a separately linked ELF into two
+private address spaces and runs it in ring 3, and then stops being what its
+programs talk to: six ring-3 tasks in six private trees exchange fifty-four
+messages through kernel endpoints, one of them hands another authority it was
+never granted at spawn, and takes it back from every holder at once — and it
+proves each of those by faulting, interrupting, measuring, preempting or blocking
+on purpose, because a correct table and a subtly wrong one are both completely
+silent until something happens.
 
 ```
 STAR OS microkernel (x86_64) v0.1.0
@@ -113,21 +118,40 @@ user 1: running at 0x400000 in its own address space
 user 2: running at 0x400000 in its own address space
 user 2: dereferencing address zero, which nothing maps here
 user fault: task "U2" took vector 14 - #PF page fault in ring 3
-  RIP=0x0000000000400084 CS=0x002b RSP=0x0000000080000000 SS=0x0023 error=0x4
+  RIP=0x0000000000400092 CS=0x002b RSP=0x0000000080000000 SS=0x0023 error=0x4
   #PF at 0x0: read from an unmapped page
   killing the task; the kernel continues
 user 1: still running after its neighbour faulted
 user: 6 syscalls served (0 refused), 216 bytes written, 1 Yield call(s) causing 0 switch(es)
-user: 31 timer interrupts arrived from ring 3 at 100 Hz (they used TSS.rsp0, nothing else could have)
-user: 2 address space(s) torn down, 24 frames returned; 12 -> 12 frames still out
+user: 32 timer interrupts arrived from ring 3 at 100 Hz (they used TSS.rsp0, nothing else could have)
+user: 2 address space(s) torn down, 28 frames returned; 12 -> 12 frames still out
 sysret: forcing a non-canonical return address (0x800000000000) on the program's first syscall
 user fault: task "N" took vector 13 - #GP general protection fault in ring 3
   RIP=0x0000800000000000 CS=0x002b RSP=0x000000007ffffff8 SS=0x0023 error=0x0
   killing the task; the kernel continues
-phase 3.2 complete: two programs, two address spaces, and one of them died alone.
+sysret: 1 return(s) went out through iretq instead; the fault arrived in ring 3, killed only that task, and its 42 frames came back
+ipc: 4 endpoints, 4 object(s) (4 live), 10 capabilities granted to 6 tasks
+[ipc] task 6 send blocked: ep0 ring full
+[server] 3 requests received in order, one of them from a blocked sender
+[ipc] task 6 send resumed
+[server] delegated send rights on its private endpoint, inside a reply
+[client] 3 requests sent into a 2-slot ring; the third waited for a slot
+[client] reply 101 carried a capability, installed as handle 3
+[client] sent through the delegated capability
+[server] the client used the delegated capability: tag 10 arrived
+[server] revoked the delegated endpoint for every holder
+[server] its own second handle to that object is dead too
+[client] the same handle now answers BadHandle: the object was revoked, not the handle
+[ipc-storm] 48 messages received from 3 senders, in order per sender
+[ipc-storm] sequence sum exact: 408
+ipc: 54 messages sent and 54 received (11 handed straight to a waiting receiver, 22 buffered), 1 capability transferred
+ipc: 21 send(s) waited for a ring slot (1 on the request endpoint, 20 on the storm), 11 receive(s) waited for a message; 32 parks, 32 wake-ups
+ipc: the delegated object is gone; its slot came back at generation 1 and the old reference still resolves to nothing
+ipc: 6 tasks finished, every task's frames returned (12 -> 12 frames out)
+phase 3.3 complete: six programs, four endpoints, one delegated capability, and one revocation that reached into somebody else's table.
 
 KERNEL FAULT: vector 8 - #DF double fault
-  the first fault was at 0xffffffff80043f68
+  the first fault was at 0xffffffff80081f88
   that is the kernel stack guard page: the stack overflowed
 ```
 
@@ -326,6 +350,74 @@ move the number at all. Leaking every page table of two address spaces went stra
 past it. The kernel now keeps its own ledger of frames handed out and not returned,
 and the phase asserts that building two trees and destroying them leaves it exactly
 where it started.
+
+Phase 3.3 is where the kernel stops being what its programs talk to. Six ring-3
+tasks in six private trees — a server, a client, three senders and a sink — pass
+fifty-four messages through four endpoints, and the interesting properties are the
+ones a working-looking demo would not have.
+
+**Authority is per direction, and delegation cannot widen it.** Every endpoint
+capability grants send or receive, never both, and the server holds *two*
+capabilities on its private endpoint: receive, which it keeps, and send, which it
+gives away. One capability carrying both rights would have handed the client the
+right to take the server's own requests, and nothing in the log would have said so.
+
+**The client is granted no access at all to the endpoint it ends up using.** The
+authority arrives inside a reply, and the handle it lands under is chosen by the
+*kernel*, in the receiver's own table — the sender could not have named it,
+because a handle is an index into one task's table and means nothing in another's.
+
+**Revocation destroys the object, not the handle.** The server revokes; the
+client's handle is never touched and stops working anyway, and so does the
+server's own second handle to the same object. The slot then comes back at a new
+generation, and the stale reference still resolves to nothing — which is what
+stops a fresh object from silently answering to a reference minted for the one
+that used to live there.
+
+**A full ring parks the sender, and the program cannot tell.** Three requests into
+two slots; the third waits inside the syscall until the server drains one. That
+one took two attempts to make honest. The server is spawned first, so it was
+already parked in `recv` when the first request arrived — first message straight
+to a waiting receiver, next two into the ring, nothing ever blocked, and the
+client printed its line about the third request waiting anyway. The server now
+spends its first two ticks being busy, and the kernel asserts the block *per
+endpoint*: a total would not have caught it either, because widening the ring to
+eight slots leaves the storm blocking seven times and the total floor satisfied
+while the client's path never blocks at all.
+
+**The storm is checked on order and arithmetic, not on arrival.** Three senders,
+sixteen messages each, a two-slot ring, and a sink that deliberately stays away
+for five ticks so every sender has to block. The sink checks that each sender's
+own sequence arrives in the order it was sent — three senders interleaving
+arbitrarily is expected; one sender's second message overtaking its first is the
+one thing a channel may not do — and that each sums to exactly 136. A channel that
+dropped one message and duplicated another keeps the count and fails the sum.
+
+**Sent and received must balance exactly, and `delivered + buffered` cannot stand
+in for it.** A send that blocks is in neither at the moment it happens: its
+message is in a wait queue, and it is buffered later by the *receive* that frees
+a slot. The first version of this check asserted on `delivered + buffered` and
+reported 34 against an expected 54 — off by exactly the number of sends that had
+waited, a number that changes with timing.
+
+Two defects surfaced that the sibling tree could not have found. A task can die
+while standing in a wait queue — a ring-3 fault kills it wherever it is — and an
+endpoint holding that slot index would hand the next message to a task whose stack
+has been reclaimed and whose address space no longer exists; `exit` now leaves
+every queue before the slot is marked dead, and the boot asserts that nobody died
+parked.
+
+And the one that only `--release` could show. `stac` and `clac` were declared
+`options(nomem)`, which promises the compiler that an `asm!` block neither reads
+nor writes memory — so it is free to move memory accesses *across* it. The only
+thing those two instructions do is decide whether the accesses between them are
+allowed. At `opt-level = "z"` LLVM hoisted the message copy straight out of the
+window, and the boot died in ring 0 with `#PF at 0x7ffffef8: supervisor read of a
+page it may not read`: the kernel reading a user stack with SMAP on, which is
+exactly the mistake SMAP exists to catch, arriving from the code that *had* asked
+for permission and been optimised out of it. It reproduced in `--release` only,
+which is why the boot matrix runs that profile. The debug build had been correct
+by luck since phase 3.1.
 
 The page tables themselves are not checked by booting. `staros-paging` abstracts
 the two things the loader and the kernel do differently — where a table frame

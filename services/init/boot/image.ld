@@ -39,6 +39,15 @@ SECTIONS
         KEEP(*(.text.start))   /* _start must be first (== e_entry) */
         *(.text .text.*)
         *(.rodata .rodata.*)
+        /* Landing-pad tables `core` emits alongside its panic paths. Named
+         * explicitly since phase 3.3, when the program grew Rust code and
+         * therefore its first `core` instantiation: an output section this
+         * script does not place gets one of lld's own, at whatever address it
+         * likes, and the result is a third PT_LOAD whose p_vaddr is not page
+         * aligned — which the kernel's loader rightly refuses. Read-only data as
+         * far as the loader is concerned, so it belongs here; nothing reads it at
+         * run time, because the program is built `-Cpanic=abort`. */
+        *(.gcc_except_table .gcc_except_table.*)
     }
 
     /* Page-align onto a fresh frame so the loader maps the writable segment with
@@ -47,6 +56,16 @@ SECTIONS
 
     .data : {
         *(.data .data.*)
+        /* Placed, not discarded, since phase 3.3. LLVM reaches the memory
+         * intrinsics the Rust roles need — `memcpy`, `memset` — through the
+         * global offset table even at `-Crelocation-model=static`, because a
+         * `#[no_mangle]` symbol is one another object could in principle
+         * interpose. Discarding the table left those `call [rip+…]` instructions
+         * pointing at address 8, which is a page fault in ring 3 the first time a
+         * program formats a line. For a static ET_EXEC the linker fills each
+         * entry with the symbol's absolute address, so the indirection costs one
+         * load and nothing else. */
+        *(.got .got.plt)
     }
 
     .bss : {
@@ -55,7 +74,6 @@ SECTIONS
     }
 
     /DISCARD/ : {
-        *(.got*)
         *(.comment)
         *(.note*)
         *(.eh_frame*)

@@ -153,7 +153,18 @@ reached_the_end() {
     expect "$log" "a bad sysret faulted in ring 3" \
         'user fault: task "N" took vector 13 - #GP general protection fault in ring 3'
     expect "$log" "and only the task died"     'killing the task; the kernel continues'
-    expect "$log" "the boot claimed the phase" 'phase 3.2 complete'
+    # And phase 3.3. The three that are machine-independent claims rather than
+    # counts: messages balanced exactly, a full ring parked a sender on the
+    # request endpoint (the `-cpu qemu64` machine is also the one without SMAP,
+    # so this is where a `stac` that is `#UD` would surface — the message copy is
+    # on the same path), and a revocation reached another task's table.
+    expect "$log" "messages balanced"          'ipc: 54 messages sent and 54 received'
+    expect "$log" "a full ring parked a sender" \
+        'send\(s\) waited for a ring slot \([1-9][0-9]* on the request endpoint'
+    expect "$log" "revocation crossed tasks"   '\[client\] the same handle now answers BadHandle'
+    expect "$log" "the storm kept its order"   '\[ipc-storm\] sequence sum exact: 408'
+    expect "$log" "all six spaces came back"   'ipc: 6 tasks finished, every task.s frames returned \(([0-9]+) -> \1 frames out\)'
+    expect "$log" "the boot claimed the phase" 'phase 3.3 complete'
     forbid "$log" "a self-test failed"         'SELF-TEST FAILED|not claiming phase'
     forbid "$log" "the loader gave up"         'BOOT FAILED'
     forbid "$log" "a panic"                    'KERNEL PANIC'

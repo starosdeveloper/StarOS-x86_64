@@ -73,6 +73,15 @@ fn main() {
         // megabytes of zeroes between the read-execute and read-write segments.
         .arg("-Clink-arg=-z")
         .arg("-Clink-arg=max-page-size=4096")
+        // No RELRO. rustc passes `-z relro -z now` by default, which makes lld
+        // cut a separate segment at the end of the read/write data so a dynamic
+        // loader can re-protect it — and the cut lands mid-page, producing a
+        // third `PT_LOAD` whose `p_vaddr` is not page aligned. This kernel's
+        // loader refuses that, correctly: a segment it cannot place on a frame
+        // boundary is one it cannot give its own rights. Nothing here is
+        // dynamically linked, so there is no relocation table to protect.
+        .arg("-Clink-arg=-z")
+        .arg("-Clink-arg=norelro")
         .arg("-o")
         .arg(&elf)
         .arg(&image_rs)

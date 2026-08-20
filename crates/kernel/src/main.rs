@@ -34,10 +34,13 @@ extern crate alloc;
 
 mod acpi;
 mod addrspace;
+mod cap;
 mod console;
 mod heap;
+mod ipc;
 mod irq;
 mod mem;
+mod obj;
 mod sched;
 mod sync;
 mod traps;
@@ -358,6 +361,13 @@ unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
                                     ok &= unsafe { usermode::selftest(console, &tables) };
                                     // SAFETY: as above, and after `selftest`.
                                     ok &= unsafe { usermode::selftest_noncanonical(console, &tables) };
+                                    // Phase 3.3, and the first stage where the
+                                    // kernel is not what the tasks are talking
+                                    // to: six ring-3 programs talking to each
+                                    // other through it.
+                                    //
+                                    // SAFETY: as above, after both 3.2 runs.
+                                    ok &= unsafe { usermode::selftest_ipc(console, &tables) };
                                 }
                                 Err(e) => {
                                     let _ = writeln!(console, "user SELF-TEST FAILED: {e}");
@@ -390,12 +400,13 @@ unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
     // that prints "complete" after a failed self-test is worse than one that
     // prints nothing: it is the line a later reader will trust.
     if !ok {
-        let _ = writeln!(console, "a self-test failed; not claiming phase 3.2. Halting.");
+        let _ = writeln!(console, "a self-test failed; not claiming phase 3.3. Halting.");
         cpu::halt()
     }
     let _ = writeln!(
         console,
-        "phase 3.2 complete: two programs, two address spaces, and one of them died alone."
+        "phase 3.3 complete: six programs, four endpoints, one delegated capability, \
+         and one revocation that reached into somebody else's table."
     );
 
     // And one that does not come back. Last, deliberately: it is the only proof

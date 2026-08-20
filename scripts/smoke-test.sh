@@ -320,9 +320,70 @@ expect "$L" "the return took the slow path deliberately" 'sysret: [1-9][0-9]* re
 expect "$L" "and the killed task's tree came back too"   'killed only that task, and its [0-9]+ frames came back'
 forbid "$L" "a fault from ring 3 reached the fatal path" 'KERNEL FAULT: vector 13'
 
+# --- phase 3.3: IPC, capabilities and revocation ---------------------------
+# Six ring-3 tasks in six private trees, granted ten capabilities between them.
+expect "$L" "the endpoints and their objects were minted" \
+    'ipc: 4 endpoints, [0-9]+ object\(s\) \([0-9]+ live\), 10 capabilities granted to 6 tasks'
+# A full ring must park the sender. The client's third request cannot be
+# buffered and cannot be handed to a receiver - the server is deliberately busy
+# for the first two ticks - so it waits inside the syscall and the kernel says
+# so from both ends.
+expect "$L" "a send blocked on a full ring"  '\[ipc\] task [0-9]+ send blocked: ep0 ring full'
+expect "$L" "and the receiver's drain resumed it" '\[ipc\] task [0-9]+ send resumed'
+expect "$L" "the client's third request waited for a slot" \
+    '\[client\] 3 requests sent into a 2-slot ring; the third waited for a slot'
+# One sender's messages must not be reordered by the ring, whatever order three
+# senders interleave in.
+expect "$L" "requests arrived in the order they were sent" \
+    '\[server\] 3 requests received in order'
+# Delegation: the client is granted no access to this endpoint at spawn. The
+# authority arrives inside a reply, and the *kernel* chooses the handle it lands
+# under - the sender never knew it, because a handle is an index into one task's
+# own table.
+expect "$L" "a capability was delegated over IPC" \
+    '\[server\] delegated send rights on its private endpoint, inside a reply'
+expect "$L" "the receiver got a handle of its own" \
+    '\[client\] reply 101 carried a capability, installed as handle [1-9][0-9]*'
+expect "$L" "and the delegated authority worked" '\[client\] sent through the delegated capability'
+expect "$L" "the server saw the delegated traffic" \
+    '\[server\] the client used the delegated capability: tag 10 arrived'
+# Revocation is global and it is the *object* that dies. Nothing touches the
+# client's table; its handle stops resolving because what it named is gone.
+expect "$L" "the object was revoked"         '\[server\] revoked the delegated endpoint for every holder'
+expect "$L" "the revoker's own second handle died with it" \
+    '\[server\] its own second handle to that object is dead too'
+expect "$L" "another task's handle stopped resolving" \
+    '\[client\] the same handle now answers BadHandle'
+expect "$L" "the slot came back at a new generation" \
+    'ipc: the delegated object is gone; its slot came back at generation [1-9]'
+# The storm: three senders, forty-eight messages, a two-slot ring and a sink
+# that stays away for five ticks. Both halves are asserted - the count and the
+# arithmetic - because a channel that dropped one message and duplicated another
+# keeps the count.
+expect "$L" "every storm message arrived, in order per sender" \
+    '\[ipc-storm\] 48 messages received from 3 senders, in order per sender'
+expect "$L" "the sequence sum is exact"      '\[ipc-storm\] sequence sum exact: 408'
+forbid "$L" "the storm lost or reordered a message" '\[ipc-storm\] FAILED'
+# Sent and received must balance exactly. `delivered + buffered` cannot stand in
+# for it: a send that blocks is in neither until the receive that frees a slot
+# deposits it.
+expect "$L" "sends and receives balance exactly" \
+    'ipc: 54 messages sent and 54 received'
+expect "$L" "exactly one capability crossed an endpoint" '1 capability transferred'
+# Per endpoint, because a total is a check that does not check: widening the ring
+# to eight slots leaves the storm blocking anyway.
+expect "$L" "the request endpoint blocked a sender" \
+    'send\(s\) waited for a ring slot \([1-9][0-9]* on the request endpoint, ([3-9]|[1-9][0-9]+) on the storm\)'
+expect "$L" "every parked task was woken again" \
+    'ipc: [0-9]+ send\(s\).*; ([0-9]+) parks, \1 wake-ups'
+expect "$L" "all six spaces came back whole" \
+    'ipc: 6 tasks finished, every task.s frames returned \(([0-9]+) -> \1 frames out\)'
+forbid "$L" "a task was left blocked at the end" 'still blocked'
+forbid "$L" "a task died while parked on an endpoint" 'died while parked'
+
 forbid "$L" "a self-test reported failure"   'SELF-TEST FAILED|did not converge|self-test FAILED'
 forbid "$L" "a phase was claimed after a failure" 'not claiming phase'
-expect "$L" "boot reached the end of phase 3.2" 'phase 3.2 complete'
+expect "$L" "boot reached the end of phase 3.3" 'phase 3.3 complete'
 
 # The last act: a deliberate stack overflow. Without a TSS, an IST and a #DF
 # gate this is a triple fault and the log simply stops - which is exactly what

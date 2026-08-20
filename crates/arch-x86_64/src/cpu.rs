@@ -208,11 +208,23 @@ impl Features {
 /// Only between here and a matching [`clac`], and only around an access the
 /// caller has already validated. Nothing may fault or be preempted in between —
 /// `AC` is part of `EFLAGS`, so an interrupt would carry it into the handler.
+/// Neither of the two below carries `nomem`, and that omission is the whole
+/// mechanism. `nomem` promises the compiler that an `asm!` block neither reads
+/// nor writes memory, which makes it free to move memory accesses *across* the
+/// block — and the only thing these two instructions do is decide whether the
+/// accesses between them are allowed. At `opt-level = "z"` LLVM took that
+/// permission and hoisted the copy in `usermode::read_user_msg` out of the window
+/// entirely: the boot died in `--release` only, in ring 0, with `#PF at
+/// 0x7ffffef8: supervisor read of a page it may not read` — the kernel reading a
+/// user stack with SMAP on, which is exactly the mistake SMAP exists to catch,
+/// arriving from the code that had asked for permission and been reordered out of
+/// it. Without `nomem` the block is an optimisation barrier for memory, which is
+/// what a window has to be.
 #[inline]
 pub unsafe fn stac() {
-    // SAFETY: forwarded. `stac` is a no-op trap-free instruction when SMAP is
+    // SAFETY: forwarded. `stac` is a trap-free instruction when SMAP is
     // supported, and the caller has established that it is.
-    unsafe { asm!("stac", options(nomem, nostack)) };
+    unsafe { asm!("stac", options(nostack)) };
 }
 
 /// Close the hole [`stac`] opened.
@@ -222,7 +234,7 @@ pub unsafe fn stac() {
 #[inline]
 pub unsafe fn clac() {
     // SAFETY: forwarded.
-    unsafe { asm!("clac", options(nomem, nostack)) };
+    unsafe { asm!("clac", options(nostack)) };
 }
 
 /// Drop the TLB entry for one page.

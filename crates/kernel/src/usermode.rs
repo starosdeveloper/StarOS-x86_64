@@ -53,12 +53,18 @@ use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use staros_abi::error::KError;
 use staros_abi::syscall::Syscall;
+use staros_abi::Handle;
 use staros_arch_x86_64::syscall::{self as arch_syscall, SyscallFrame};
 use staros_arch_x86_64::{cpu, usermode};
 use staros_elf64::Elf;
 
+use staros_ipc::Message;
+
 use crate::addrspace::{AddressSpace, USER_STACK_TOP};
+use crate::cap::Cap;
 use crate::console::Console;
+use crate::ipc::{self, KMessage};
+use crate::obj::{self, Object};
 use crate::vm::Tables;
 use crate::{mem, sched};
 
@@ -117,6 +123,9 @@ static ARM_NONCANONICAL: AtomicBool = AtomicBool::new(false);
 
 /// Faults taken in ring 3, which kill a task and nothing else.
 static USER_FAULTS: AtomicU64 = AtomicU64::new(0);
+
+/// Objects destroyed by a ring-3 `Revoke` that found them alive.
+static REVOCATIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Ring-3 faults so far.
 #[must_use]
@@ -274,6 +283,41 @@ fn on_syscall(frame: &mut SyscallFrame) {
                 frame.rip = NONCANONICAL_RIP;
             }
         }
+        // The three phase-3.3 calls. Each of them can block — `Send` on a full
+        // ring, `Recv` on an empty one — which is why `GS` is put back the way
+        // ring-0 code expects around them, exactly as `Yield` does: a switch in
+        // the middle leaves this core running somebody else's code, and the
+        // kernel base in `GS` would be waiting there for the next syscall from
+        // any task to swap it into the user's.
+        Some(Syscall::Send) => {
+            // SAFETY: ring 0, inside the syscall path, paired with the call below.
+            unsafe { arch_syscall::swap_gs() };
+            let rc = sys_send(frame.rdi as u32, frame.rsi);
+            // SAFETY: the pairing. Back on this core, about to return through the
+            // stub, which expects the kernel base in `GS`.
+            unsafe { arch_syscall::swap_gs() };
+            frame.rax = rc as u64;
+            if corrupt {
+                frame.rip = NONCANONICAL_RIP;
+            }
+        }
+        Some(Syscall::Recv) => {
+            // SAFETY: as `Send` above.
+            unsafe { arch_syscall::swap_gs() };
+            let rc = sys_recv(frame.rdi as u32, frame.rsi);
+            // SAFETY: the pairing.
+            unsafe { arch_syscall::swap_gs() };
+            frame.rax = rc as u64;
+            if corrupt {
+                frame.rip = NONCANONICAL_RIP;
+            }
+        }
+        Some(Syscall::Revoke) => {
+            frame.rax = sys_revoke(frame.rdi as u32) as u64;
+            if corrupt {
+                frame.rip = NONCANONICAL_RIP;
+            }
+        }
         _ => {
             REFUSED.fetch_add(1, Ordering::Relaxed);
             frame.rax = KError::NoSuchSyscall.as_raw() as u64;
@@ -349,6 +393,506 @@ fn debug_write(ptr: u64, len: u64) -> u64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 3.3: IPC, capabilities and revocation.
+// ---------------------------------------------------------------------------
+
+/// Copy a [`Message`] out of ring 3's memory.
+///
+/// Two checks before the copy and neither is optional. The address must be
+/// mapped and user-readable *in the caller's own tree* — being in the user half
+/// proves nothing since 3.2, and a walk is the only way to know. And it must be
+/// eight-byte aligned, because the struct is `u64`-aligned and a misaligned
+/// `read_unaligned` here would be papering over a caller whose pointer arithmetic
+/// is wrong.
+fn read_user_msg(ptr: u64) -> Option<Message> {
+    let len = core::mem::size_of::<Message>() as u64;
+    if !ptr.is_multiple_of(8) {
+        return None;
+    }
+    let space = sched::current_space()?;
+    if !space.range_ok(ptr, len, false) {
+        return None;
+    }
+    let mut msg = Message::new(0);
+    // SAFETY: the range is mapped and user-readable in the live tree, the
+    // destination is a whole `Message` on this frame's stack, and the two regions
+    // cannot overlap. The SMAP window is exactly as wide as the copy; `stac` is
+    // issued only on a CPU that has SMAP, since elsewhere it is `#UD`.
+    unsafe {
+        let smap = SMAP_ON.load(Ordering::Relaxed);
+        if smap {
+            cpu::stac();
+        }
+        core::ptr::copy_nonoverlapping(
+            ptr as *const u8,
+            (&raw mut msg).cast::<u8>(),
+            len as usize,
+        );
+        if smap {
+            cpu::clac();
+        }
+    }
+    Some(msg)
+}
+
+/// Copy a [`Message`] into ring 3's memory. The write counterpart of
+/// [`read_user_msg`], and the `true` in `range_ok` is the whole difference: a
+/// receive buffer in a read-only page is a program that would silently never see
+/// its message.
+fn write_user_msg(ptr: u64, msg: Message) -> bool {
+    let len = core::mem::size_of::<Message>() as u64;
+    if !ptr.is_multiple_of(8) {
+        return false;
+    }
+    let Some(space) = sched::current_space() else {
+        return false;
+    };
+    if !space.range_ok(ptr, len, true) {
+        return false;
+    }
+    // SAFETY: as `read_user_msg`, with the range verified writable.
+    unsafe {
+        let smap = SMAP_ON.load(Ordering::Relaxed);
+        if smap {
+            cpu::stac();
+        }
+        core::ptr::copy_nonoverlapping(
+            (&raw const msg).cast::<u8>(),
+            ptr as *mut u8,
+            len as usize,
+        );
+        if smap {
+            cpu::clac();
+        }
+    }
+    true
+}
+
+/// Resolve `handle` to the endpoint id it names, checking both the right the
+/// caller holds and whether the object still exists.
+///
+/// Those are two different failures and they answer differently on purpose. A
+/// handle naming a capability without the direction asked for is
+/// [`KError::PermissionDenied`] — the holder has *something*, just not this. A
+/// handle whose object has been revoked is [`KError::BadHandle`], the same answer
+/// as a handle that never existed, because from the holder's side there is no
+/// difference: the authority is gone.
+fn endpoint_for(handle: u32, want_send: bool) -> Result<usize, KError> {
+    match sched::resolve_cap(handle) {
+        Some(Cap::Endpoint { obj, send, recv }) => {
+            if (want_send && !send) || (!want_send && !recv) {
+                return Err(KError::PermissionDenied);
+            }
+            match obj::get(obj) {
+                Some(Object::Endpoint { id }) => Ok(id),
+                None => Err(KError::BadHandle),
+            }
+        }
+        None => Err(KError::BadHandle),
+    }
+}
+
+/// `Send`: `RDI` = an endpoint handle, `RSI` = a pointer to the caller's
+/// [`Message`].
+///
+/// A message may carry one of the caller's own capabilities, named by
+/// `Message.cap`. The kernel resolves it *here*, in the sender's table, and
+/// carries the resolved capability — a handle is an index into one task's table
+/// and means nothing in another's, so passing the number would hand the receiver
+/// whatever happened to sit at that index in its own.
+fn sys_send(handle: u32, msg_ptr: u64) -> isize {
+    let id = match endpoint_for(handle, true) {
+        Ok(id) => id,
+        Err(e) => {
+            REFUSED.fetch_add(1, Ordering::Relaxed);
+            return e.as_raw();
+        }
+    };
+    let Some(msg) = read_user_msg(msg_ptr) else {
+        return KError::InvalidArgument.as_raw();
+    };
+    let cap = if msg.cap.is_null() {
+        None
+    } else {
+        match sched::resolve_cap(msg.cap.0) {
+            Some(c) => Some(c),
+            None => return KError::BadHandle.as_raw(),
+        }
+    };
+    ipc::send(id, KMessage { msg, cap })
+}
+
+/// `Recv`: `RDI` = an endpoint handle, `RSI` = a pointer to a [`Message`] to
+/// fill. Blocks until something arrives.
+///
+/// A transferred capability is installed into *this* task's table and the fresh
+/// handle written into the message the caller reads back. The receiver therefore
+/// learns the handle the same way it learns the payload, which is the only way it
+/// could: the sender never knew it.
+fn sys_recv(handle: u32, msg_ptr: u64) -> isize {
+    let id = match endpoint_for(handle, false) {
+        Ok(id) => id,
+        Err(e) => {
+            REFUSED.fetch_add(1, Ordering::Relaxed);
+            return e.as_raw();
+        }
+    };
+    // Check the destination *before* blocking. A receiver parked on an endpoint
+    // with an unwritable buffer consumes a message and then discards it, and the
+    // sender has no way to find out.
+    if !write_user_msg(msg_ptr, Message::new(0)) {
+        return KError::InvalidArgument.as_raw();
+    }
+    let km = match ipc::recv(id) {
+        Ok(km) => km,
+        Err(e) => return e.as_raw(),
+    };
+    let mut msg = km.msg;
+    msg.cap = match km.cap {
+        Some(cap) => match sched::install_cap_current(cap) {
+            Some(h) => Handle(h),
+            None => return KError::OutOfResources.as_raw(),
+        },
+        None => Handle::NULL,
+    };
+    if write_user_msg(msg_ptr, msg) {
+        0
+    } else {
+        KError::InvalidArgument.as_raw()
+    }
+}
+
+/// `Revoke`: `RDI` = a handle. Destroys the *object* it names, for everyone.
+///
+/// Not a slot drop. The caller's handle keeps resolving to a capability; what
+/// stops resolving is the capability's reference into the object table — in this
+/// task and in every other, including copies delegated over IPC minutes earlier.
+/// That is the whole reason a capability holds an [`ObjectRef`](crate::obj) and
+/// not the object.
+fn sys_revoke(handle: u32) -> isize {
+    match sched::resolve_cap(handle) {
+        Some(cap) => {
+            if obj::revoke(cap.object()) {
+                REVOCATIONS.fetch_add(1, Ordering::Relaxed);
+                0
+            } else {
+                // Already revoked, by this task or another. Idempotent rather than
+                // an event, so a doubled revoke is not a second story.
+                KError::BadHandle.as_raw()
+            }
+        }
+        None => KError::BadHandle.as_raw(),
+    }
+}
+
+/// The ids the phase-3.3 roles run under, in spawn order. The program branches
+/// on the id byte the kernel seeds, exactly as 3.2's two tasks do.
+const ROLE_SERVER: u8 = 3;
+const ROLE_CLIENT: u8 = 4;
+const ROLE_SENDERS: [u8; 3] = [5, 6, 7];
+const ROLE_SINK: u8 = 8;
+
+/// Messages that must cross an endpoint during [`selftest_ipc`], counted from the
+/// protocol the program implements: three requests, two replies, one message
+/// through the delegated capability, and forty-eight from the storm.
+///
+/// An exact number rather than a floor, and the two refused sends are
+/// deliberately not in it — they never reach [`ipc::send`], because the handle
+/// stops resolving one layer above. A count that included them would still pass
+/// if revocation quietly let one through.
+const EXPECTED_MESSAGES: u64 = 3 + 2 + 1 + 48;
+
+/// Sends that must have had to wait for a ring slot, **per endpoint**: the
+/// client's third request, and at least one from each storm sender.
+///
+/// Floors rather than exact numbers, because how often the three senders block
+/// depends on when the timer preempts them — but *that* they block is fixed by
+/// the arithmetic: two ring slots, three senders, and a sink that stays away for
+/// five ticks before its first receive.
+///
+/// Per endpoint, because a total is a check that does not check. Widening the
+/// ring to eight slots leaves the storm blocking seven times, so a total-only
+/// floor of four still passes while the client — whose line in the boot log says
+/// its third request waited — never waits for anything.
+const MIN_REQUEST_BLOCKS: u64 = 1;
+const MIN_STORM_BLOCKS: u64 = 3;
+
+/// Phase 3.3: six programs, four endpoints, one delegated capability and one
+/// revocation.
+///
+/// The claims this run establishes, each of which fails loudly rather than
+/// quietly:
+///
+/// - **messages cross address spaces** — six ring-3 tasks in six private trees
+///   exchange fifty-four messages that exist, in between, only inside the kernel.
+/// - **rights are per direction** — every endpoint capability grants send or
+///   receive, not both, and the roles are built from that asymmetry.
+/// - **a full ring blocks the sender** — three requests into two slots, and
+///   dozens more in the storm; the sender parks inside the syscall and cannot
+///   tell it did.
+/// - **order is preserved per sender** — three senders interleave arbitrarily,
+///   but each one's own sequence arrives in the order it was sent, and the sink
+///   checks both the ordering and the exact sum.
+/// - **capabilities are delegated, not guessed** — the client is granted no
+///   access to the endpoint it ends up using; the authority arrives inside a
+///   message and the kernel allocates the handle it lands under.
+/// - **revocation is global** — the server destroys the object, and the client's
+///   handle, minted by the kernel and never touched since, stops resolving.
+///   So does the server's own second handle to the same object.
+/// - **nothing is left waiting** — no task is still blocked at the end, and every
+///   frame the six spaces owned came back.
+///
+/// # Safety
+/// Called once, after [`selftest`], with the timer calibrated.
+pub unsafe fn selftest_ipc(console: &mut Console, tables: &Tables) -> bool {
+    let before = mem::frames_in_use();
+
+    // The four endpoints, and the objects that name them. `obj::create` refuses
+    // an id past the end of the endpoint table, so a mismatch between these
+    // constants and `ipc::NUM_ENDPOINTS` fails here rather than inside a server.
+    let mut refs = [None; 4];
+    for (slot, id) in refs.iter_mut().zip([
+        ipc::REQUEST_EP,
+        ipc::REPLY_EP,
+        ipc::DELEGATED_EP,
+        ipc::STORM_EP,
+    ]) {
+        match obj::create(Object::Endpoint { id }) {
+            Some(r) => *slot = Some(r),
+            None => {
+                let _ = writeln!(console, "ipc SELF-TEST FAILED: no object for endpoint {id}");
+                return false;
+            }
+        }
+    }
+    let [Some(request), Some(reply), Some(delegated), Some(storm)] = refs else {
+        let _ = writeln!(console, "ipc SELF-TEST FAILED: an endpoint object went missing");
+        return false;
+    };
+
+    let send_on = |obj| Cap::Endpoint {
+        obj,
+        send: true,
+        recv: false,
+    };
+    let recv_on = |obj| Cap::Endpoint {
+        obj,
+        send: false,
+        recv: true,
+    };
+
+    // Handle numbers are not chosen here — they fall out of the order of these
+    // grants, bottom-up from 1, and the program knows them by that order. The
+    // server gets *two* capabilities on the delegated endpoint, receive and send,
+    // because it keeps the first and gives the second away: one capability with
+    // both rights would have handed the client the right to steal its own
+    // requests.
+    let roles: [(u8, &'static str, &[Cap]); 6] = [
+        (
+            ROLE_SERVER,
+            "SRV",
+            &[
+                recv_on(request),
+                send_on(reply),
+                recv_on(delegated),
+                send_on(delegated),
+            ],
+        ),
+        (ROLE_CLIENT, "CLI", &[send_on(request), recv_on(reply)]),
+        (ROLE_SENDERS[0], "S5", &[send_on(storm)]),
+        (ROLE_SENDERS[1], "S6", &[send_on(storm)]),
+        (ROLE_SENDERS[2], "S7", &[send_on(storm)]),
+        (ROLE_SINK, "SNK", &[recv_on(storm)]),
+    ];
+
+    let mut granted = 0;
+    for (id, name, grants) in roles {
+        let space = match build_space(tables, id) {
+            Ok(space) => space,
+            Err(e) => {
+                let _ = writeln!(console, "ipc SELF-TEST FAILED: {e}");
+                return false;
+            }
+        };
+        let Some(mut caps) = crate::cap::empty_caps() else {
+            let _ = writeln!(console, "ipc SELF-TEST FAILED: no heap for a capability table");
+            return false;
+        };
+        for cap in grants {
+            if crate::cap::install(&mut caps, *cap).is_none() {
+                let _ = writeln!(console, "ipc SELF-TEST FAILED: could not grant task {id}");
+                return false;
+            }
+            granted += 1;
+        }
+        if !sched::spawn_user(name, user_task, space, caps) {
+            let _ = writeln!(console, "ipc SELF-TEST FAILED: could not spawn task {id}");
+            return false;
+        }
+    }
+
+    let (objects, live) = obj::census();
+    let _ = writeln!(
+        console,
+        "ipc: {} endpoints, {objects} object(s) ({live} live), {granted} capabilities granted \
+         to 6 tasks",
+        ipc::NUM_ENDPOINTS,
+    );
+
+    let faults_before = user_faults();
+    // SAFETY: as `selftest` — the timer is calibrated and its vector is the only
+    // unmasked source.
+    let Ok(_hz) = (unsafe { crate::irq::start_ticking() }) else {
+        let _ = writeln!(console, "ipc SELF-TEST FAILED: the timer would not start");
+        return false;
+    };
+
+    sched::start();
+
+    // SAFETY: nothing after this expects to be interrupted.
+    unsafe { crate::irq::stop_ticking() };
+
+    let ipc = ipc::stats();
+    let (blocks, wakeups, died_blocked) = sched::block_counts();
+    let faults = user_faults() - faults_before;
+    let still_blocked = sched::blocked_tasks();
+    let after = mem::frames_in_use();
+
+    let _ = writeln!(
+        console,
+        "ipc: {} messages sent and {} received ({} handed straight to a waiting receiver, \
+         {} buffered), {} capability transferred",
+        ipc.sent, ipc.received, ipc.delivered, ipc.buffered, ipc.caps_moved,
+    );
+    let _ = writeln!(
+        console,
+        "ipc: {} send(s) waited for a ring slot ({} on the request endpoint, {} on the storm), \
+         {} receive(s) waited for a message; {blocks} parks, {wakeups} wake-ups",
+        ipc.send_blocks,
+        ipc::send_blocks_on(ipc::REQUEST_EP),
+        ipc::send_blocks_on(ipc::STORM_EP),
+        ipc.recv_blocks,
+    );
+
+    if faults != 0 {
+        let _ = writeln!(
+            console,
+            "ipc SELF-TEST FAILED: {faults} ring-3 fault(s) during a phase where nothing \
+             should have died"
+        );
+        return false;
+    }
+    if ipc.sent != EXPECTED_MESSAGES || ipc.received != EXPECTED_MESSAGES {
+        // Not "at least", and both halves: a protocol that delivered a message
+        // twice, or that let a revoked handle through, or that left one in a ring
+        // nobody drained, lands here rather than reading as success.
+        let _ = writeln!(
+            console,
+            "ipc SELF-TEST FAILED: {} sent and {} received, expected exactly \
+             {EXPECTED_MESSAGES} of each",
+            ipc.sent, ipc.received,
+        );
+        return false;
+    }
+    let request_blocks = ipc::send_blocks_on(ipc::REQUEST_EP);
+    let storm_blocks = ipc::send_blocks_on(ipc::STORM_EP);
+    if request_blocks < MIN_REQUEST_BLOCKS || storm_blocks < MIN_STORM_BLOCKS {
+        // A ring big enough never to fill makes every other assertion here pass
+        // while the blocking-send path has never run.
+        let _ = writeln!(
+            console,
+            "ipc SELF-TEST FAILED: {request_blocks} blocked send(s) on the request endpoint \
+             (needs {MIN_REQUEST_BLOCKS}) and {storm_blocks} on the storm endpoint \
+             (needs {MIN_STORM_BLOCKS})"
+        );
+        return false;
+    }
+    if blocks != wakeups {
+        let _ = writeln!(
+            console,
+            "ipc SELF-TEST FAILED: {blocks} task(s) parked but {wakeups} were woken"
+        );
+        return false;
+    }
+    if still_blocked != 0 || died_blocked != 0 {
+        let _ = writeln!(
+            console,
+            "ipc SELF-TEST FAILED: {still_blocked} task(s) still blocked, {died_blocked} died \
+             while parked"
+        );
+        sched::describe(console);
+        return false;
+    }
+    if ipc.caps_moved != 1 {
+        let _ = writeln!(
+            console,
+            "ipc SELF-TEST FAILED: {} capabilities crossed an endpoint, expected 1",
+            ipc.caps_moved,
+        );
+        return false;
+    }
+
+    // The revocation, checked from the kernel's side as well as the program's.
+    // The client reported that its handle stopped working; this says the *object*
+    // is what stopped existing, which is the claim that "revoked" makes.
+    let revocations = REVOCATIONS.load(Ordering::Relaxed);
+    if revocations != 1 || obj::get(delegated).is_some() {
+        let _ = writeln!(
+            console,
+            "ipc SELF-TEST FAILED: {revocations} revocation(s), and the delegated object is \
+             {}",
+            if obj::get(delegated).is_some() { "still live" } else { "gone" },
+        );
+        return false;
+    }
+    // A revoked slot is reusable, and reusing it must not resurrect the old
+    // reference: the generation moved on, so the same `ObjectRef` naming a
+    // freshly created object still fails to resolve.
+    let Some(reused) = obj::create(Object::Endpoint { id: ipc::DELEGATED_EP }) else {
+        let _ = writeln!(console, "ipc SELF-TEST FAILED: the revoked slot was not reusable");
+        return false;
+    };
+    if reused.index != delegated.index || reused.generation == delegated.generation {
+        let _ = writeln!(
+            console,
+            "ipc SELF-TEST FAILED: the revoked slot came back as index {} generation {} \
+             (was {} / {})",
+            reused.index, reused.generation, delegated.index, delegated.generation,
+        );
+        return false;
+    }
+    if obj::get(delegated).is_some() {
+        let _ = writeln!(
+            console,
+            "ipc SELF-TEST FAILED: the stale reference resolves against the slot's new tenant"
+        );
+        return false;
+    }
+    obj::revoke(reused);
+
+    let _ = writeln!(
+        console,
+        "ipc: the delegated object is gone; its slot came back at generation {} and the old \
+         reference still resolves to nothing",
+        reused.generation,
+    );
+
+    if after != before {
+        let _ = writeln!(
+            console,
+            "ipc SELF-TEST FAILED: six address spaces did not come back \
+             ({before} -> {after} frames still out)"
+        );
+        return false;
+    }
+    let _ = writeln!(
+        console,
+        "ipc: 6 tasks finished, every task's frames returned ({before} -> {after} frames out)"
+    );
+    true
+}
+
 /// Run the same program twice, in two address spaces, and make one of them fault.
 ///
 /// The criterion for phase 3.2, and it is several claims the one run establishes:
@@ -411,7 +955,14 @@ pub unsafe fn selftest(console: &mut Console, tables: &Tables) -> bool {
             return false;
         }
         let name = if id == 1 { "U1" } else { "U2" };
-        if !sched::spawn_user(name, user_task, space) {
+        // Phase 3.2's two programs are granted nothing at all, and that is the
+        // statement: every syscall they make is one that needs no authority. The
+        // capability-carrying tasks arrive in [`selftest_ipc`].
+        let Some(caps) = crate::cap::empty_caps() else {
+            let _ = writeln!(console, "user SELF-TEST FAILED: no heap for a capability table");
+            return false;
+        };
+        if !sched::spawn_user(name, user_task, space, caps) {
             let _ = writeln!(console, "user SELF-TEST FAILED: could not spawn task {id}");
             return false;
         }
@@ -559,7 +1110,11 @@ pub unsafe fn selftest_noncanonical(console: &mut Console, tables: &Tables) -> b
             return false;
         }
     };
-    if !sched::spawn_user("N", user_task, space) {
+    let Some(caps) = crate::cap::empty_caps() else {
+        let _ = writeln!(console, "sysret SELF-TEST FAILED: no heap for a capability table");
+        return false;
+    };
+    if !sched::spawn_user("N", user_task, space, caps) {
         let _ = writeln!(console, "sysret SELF-TEST FAILED: could not spawn the task");
         return false;
     }

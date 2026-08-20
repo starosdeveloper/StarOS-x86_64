@@ -14,23 +14,34 @@
 //! [`exit`] is one, taken twice.
 //!
 //! ## What this is not, yet
-//! The aarch64 tree's `sched` is the same shape carrying four more phases of
-//! cargo: an address space per task, a capability table, an IPC mailbox, a
-//! lost-wakeup flag, an on-cpu flag, per-core arrays. None of that is here, and
-//! none of it is stubbed, because every one of those fields exists to solve a
-//! problem this kernel does not have yet:
+//! The aarch64 tree's `sched` is the same shape carrying more phases of cargo:
+//! an on-cpu flag, per-core arrays, a lost-wakeup flag, sleep deadlines. None of
+//! that is here, and none of it is stubbed, because every one of those fields
+//! exists to solve a problem this kernel does not have yet:
 //!
-//! - **No `ttbr0`/`CR3` per task.** There is one address space until phase 3.2.
-//!   A field that always holds the same value is not a field, it is a comment.
-//! - **No `Blocked` state, no mailbox, no `wake_pending`.** Nothing can block:
-//!   there is no IPC until 3.3. A `Blocked` variant nothing enters would make
-//!   [`Scheduler::pick_next`] look like it handled a case it has never seen.
 //! - **No `on_cpu`, no per-core arrays.** Both exist to keep one core from
 //!   loading a context another core has not finished saving. With one core the
 //!   switch that saves a context and the pick that could load it are the same
 //!   instruction stream, so the window does not exist. Phase 4 opens it, and that
 //!   is where the flag belongs — added with a failure that motivates it, not
 //!   inherited as decoration.
+//! - **No `wake_pending`.** The aarch64 tree needs it because a peer on another
+//!   core can wake a task in the window between it registering as a waiter and it
+//!   actually parking. Here the only thing that ever wakes a task is *another
+//!   task's* send or receive, and another task cannot execute until this one has
+//!   switched away — the window is not narrow, it is empty. Phase 4 creates it,
+//!   and this is the sentence to delete then.
+//! - **No sleep deadlines.** `SleepUntil` and `WaitAny` are notification-shaped
+//!   syscalls that arrive with device drivers in user space, and a `Sleeping`
+//!   state nothing enters would make [`Scheduler::pick_next`] look like it
+//!   handled a case it has never seen.
+//!
+//! What phase 3.3 *did* add is the pair that IPC cannot be built without: the
+//! [`State::Blocked`] state and the [`Task::mailbox`] a sender delivers into,
+//! plus a [capability table](crate::cap) per task. All three were deliberately
+//! absent in 2.4 and 3.2 — a task that could be blocked with nothing to block on
+//! is a state machine with an unreachable state — and all three now have exactly
+//! one caller each in [`crate::ipc`].
 //!
 //! What *is* here is what a single core genuinely needs, including the part that
 //! is easy to skip: [`PREV`] and [`post_switch`]. A task cannot free its own
@@ -59,7 +70,9 @@ use staros_arch_x86_64::context::{self, context_switch, CpuContext};
 use staros_arch_x86_64::{cpu, gdt, syscall};
 
 use crate::addrspace::AddressSpace;
+use crate::cap::{self, Cap, CapTable};
 use crate::console::Console;
+use crate::ipc::KMessage;
 use crate::kprintln;
 use crate::sync::SpinLock;
 
@@ -77,6 +90,11 @@ enum State {
     Ready,
     /// Currently executing.
     Running,
+    /// Parked on an IPC wait queue: not runnable until a peer delivers a message
+    /// or frees a ring slot. The scheduler cannot say *what* a task is waiting
+    /// for — the queues live in [`crate::ipc`], which is what
+    /// [`crate::ipc::waiting_on`] is for.
+    Blocked,
     /// Finished; will not be scheduled again.
     Dead,
 }
@@ -87,6 +105,7 @@ impl State {
         match self {
             Self::Ready => "ready",
             Self::Running => "running",
+            Self::Blocked => "blocked",
             Self::Dead => "dead",
         }
     }
@@ -119,6 +138,17 @@ struct Task {
     /// The ring-3 address space, if this is a user task. `None` for a kernel
     /// thread, which runs in the kernel's own tree and owns no user pages.
     space: Option<AddressSpace>,
+    /// What this task is permitted to do. A kernel thread's table is empty and
+    /// stays empty; a ring-3 task's is seeded at spawn and grows when a
+    /// capability is delegated to it over IPC.
+    caps: CapTable,
+    /// A message delivered to this task while it was blocked in `Recv`.
+    ///
+    /// Filled by [`deliver`] from *inside the sender's* syscall, and taken by the
+    /// receiver the moment it is scheduled again. Not a queue: a task can only be
+    /// blocked in one receive at a time, so at most one message can be in flight
+    /// to it — anything further is buffered at the endpoint, where it belongs.
+    mailbox: Option<KMessage>,
     state: State,
     id: usize,
     /// What the boot log calls it. A task is otherwise identified only by a slot
@@ -293,6 +323,22 @@ static PREEMPTIONS: AtomicU64 = AtomicU64::new(0);
 /// ever cooperates both look like "switches happened" from the outside.
 static YIELDS: AtomicU64 = AtomicU64::new(0);
 
+/// Tasks parked on an IPC wait queue, and tasks woken off one.
+///
+/// Two numbers rather than one, because they answer different questions. Parks
+/// with no wakeups is a system that blocked and stayed blocked; equal counts at
+/// the end of a run mean everything that went to sleep was woken by somebody.
+static BLOCKS: AtomicU64 = AtomicU64::new(0);
+static WAKEUPS: AtomicU64 = AtomicU64::new(0);
+
+/// Tasks that died while standing in a wait queue.
+///
+/// Nonzero is not an error — a ring-3 fault kills a task wherever it is — but it
+/// is the count that says [`exit`]'s call to [`crate::ipc::forget_task`] had work
+/// to do. Without that call the queue keeps the slot of a task whose stack has
+/// been reaped, and the next send delivers a message into it.
+static DIED_BLOCKED: AtomicU64 = AtomicU64::new(0);
+
 /// Dead-task stacks reclaimed, and the 64-bit words that returned to the heap.
 static REAPED_STACKS: AtomicU64 = AtomicU64::new(0);
 static REAPED_WORDS: AtomicU64 = AtomicU64::new(0);
@@ -345,6 +391,23 @@ pub fn reaped_stacks() -> (u64, u64) {
     )
 }
 
+/// How many task slots are still parked on a wait queue.
+///
+/// Zero at the end of a run is the difference between "every task finished" and
+/// "every task that could finish did". A blocked task at shutdown is a deadlock
+/// or a lost message, and it produces no other symptom — the boot simply moves
+/// on, because a scheduler with nothing runnable is indistinguishable from a
+/// scheduler with nothing left to do.
+#[must_use]
+pub fn blocked_tasks() -> usize {
+    let sched = SCHED.lock();
+    sched
+        .tasks
+        .iter()
+        .filter(|t| t.state == State::Blocked)
+        .count()
+}
+
 /// How many task slots exist. A high-water mark: slots are never reused, because
 /// their indices name tasks and reuse would need proof the dead one has left.
 #[must_use]
@@ -374,13 +437,31 @@ pub fn describe(console: &mut Console) {
         let Some((id, name, state, stack_bytes)) = snapshot else {
             continue;
         };
-        let _ = writeln!(
-            console,
-            "sched: task {id} \"{name}\" {}, {} KiB of stack {}",
-            state.as_str(),
-            stack_bytes / 1024,
-            if stack_bytes == 0 { "(reclaimed)" } else { "held" },
-        );
+        // What a blocked task is waiting for lives in the endpoint tables, not
+        // here: "blocked" alone cannot tell a client owed a reply from one parked
+        // on a queue nothing will ever send to.
+        let waiting = if state == State::Blocked {
+            crate::ipc::waiting_on(i)
+        } else {
+            None
+        };
+        let held = if stack_bytes == 0 { "(reclaimed)" } else { "held" };
+        let kib = stack_bytes / 1024;
+        let _ = match waiting {
+            Some((ep, true)) => writeln!(
+                console,
+                "sched: task {id} \"{name}\" blocked sending on ep{ep}, {kib} KiB of stack {held}",
+            ),
+            Some((ep, false)) => writeln!(
+                console,
+                "sched: task {id} \"{name}\" blocked receiving on ep{ep}, {kib} KiB of stack {held}",
+            ),
+            None => writeln!(
+                console,
+                "sched: task {id} \"{name}\" {}, {kib} KiB of stack {held}",
+                state.as_str(),
+            ),
+        };
     }
 }
 
@@ -389,19 +470,36 @@ pub fn describe(console: &mut Console) {
 /// Returns `false` if the heap could not supply a stack or a slot — the machine's
 /// answer, not a number chosen in advance.
 pub fn spawn(name: &'static str, entry: extern "C" fn()) -> bool {
-    spawn_with(name, entry, None)
+    cap::empty_caps().is_some_and(|caps| spawn_with(name, entry, None, caps))
 }
 
-/// Create a **ring-3** task: a kernel thread whose entry drops into `space`.
+/// Create a **ring-3** task: a kernel thread whose entry drops into `space`,
+/// holding exactly the capabilities in `caps`.
 ///
 /// The task owns the space: when it dies, its successor tears the tree down and
 /// returns every frame (see [`post_switch`]).
-pub fn spawn_user(name: &'static str, entry: extern "C" fn(), space: AddressSpace) -> bool {
-    spawn_with(name, entry, Some(space))
+///
+/// Capabilities are handed over at creation rather than granted afterwards
+/// because there is no moment in between: a task becomes runnable the instant it
+/// is in the table, and a ring-3 program that ran one instruction with an empty
+/// capability table would see every syscall refused for reasons that have nothing
+/// to do with what it was granted.
+pub fn spawn_user(
+    name: &'static str,
+    entry: extern "C" fn(),
+    space: AddressSpace,
+    caps: CapTable,
+) -> bool {
+    spawn_with(name, entry, Some(space), caps)
 }
 
-/// The body of both, with the address space as the only difference.
-fn spawn_with(name: &'static str, entry: extern "C" fn(), space: Option<AddressSpace>) -> bool {
+/// The body of both, with the address space and the grants as the difference.
+fn spawn_with(
+    name: &'static str,
+    entry: extern "C" fn(),
+    space: Option<AddressSpace>,
+    caps: CapTable,
+) -> bool {
     // Point the arch crate's trampoline back at this module. Done here, in the
     // only way a task can come into existence, rather than in an `init` a future
     // caller could forget: the trampoline is unreachable until a task exists, and
@@ -434,6 +532,8 @@ fn spawn_with(name: &'static str, entry: extern "C" fn(), space: Option<AddressS
         // that does not exist yet.
         cr3: space.map_or_else(cpu::read_cr3, |s| s.root()),
         space,
+        caps,
+        mailbox: None,
         state: State::Ready,
         id: 0,
         name,
@@ -613,6 +713,179 @@ fn reschedule() -> bool {
     true
 }
 
+/// Park the current task as [`State::Blocked`] and switch away, resuming here
+/// once a peer has made it `Ready` again and the scheduler has picked it.
+///
+/// The caller must **already** have arranged to be woken — registered itself on
+/// an endpoint's wait queue under that endpoint's lock — before calling this.
+/// Doing it the other way round is the classic lost wakeup.
+///
+/// On this kernel it is not merely the classic ordering, it is sufficient. The
+/// only thing that ever calls [`unblock`] or [`deliver`] is *another task* inside
+/// its own `Send` or `Recv`, and with one core another task cannot execute a
+/// single instruction until this one has switched away — which happens below,
+/// after the state is already `Blocked`. There is no window to lose a wakeup in.
+/// Phase 4 opens one, and that is where a `wake_pending` flag belongs.
+///
+/// Unlike [`reschedule`], this cannot decline. A task that has registered as a
+/// waiter and then keeps running would take the message meant for it and never
+/// look; so when nothing else is runnable this goes to the bootstrap context,
+/// which decides whether the system is finished. A boot that ends there with
+/// blocked tasks is a deadlock, and [`describe`] names who was waiting on what.
+fn park_and_switch() {
+    // SAFETY: the switch happens inside an interrupt-masked critical section;
+    // the matching restore runs when this task is resumed.
+    let saved = unsafe { cpu::irq_save() };
+
+    let prev_ptr: *mut CpuContext;
+    let next_ptr: *const CpuContext;
+    let next_top: Option<u64>;
+    let next_cr3: u64;
+    {
+        let mut sched = SCHED.lock();
+        let prev = sched.current;
+        // Blocking from the bootstrap context would be blocking the thing that
+        // resumes blocked tasks. Nothing does it: every caller arrives from a
+        // syscall, which by definition ran in a task.
+        assert!(prev != NONE, "blocked outside a task");
+        sched.tasks[prev].state = State::Blocked;
+        BLOCKS.fetch_add(1, Ordering::Relaxed);
+        PREV.store(prev, Ordering::Relaxed);
+        prev_ptr = &mut sched.tasks[prev].ctx;
+        match sched.pick_next(prev) {
+            Some(next) => {
+                sched.tasks[next].state = State::Running;
+                sched.current = next;
+                next_top = Some(sched.tasks[next].kernel_stack_top);
+                next_cr3 = sched.tasks[next].cr3;
+                next_ptr = &sched.tasks[next].ctx;
+            }
+            None => {
+                sched.current = NONE;
+                next_top = None;
+                next_cr3 = KERNEL_ROOT.load(Ordering::SeqCst);
+                next_ptr = &sched.bootstrap;
+            }
+        }
+    }
+    enter(next_top, Some(next_cr3));
+    SWITCHES.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: `pick_next` never returns `prev` and the bootstrap context is not a
+    // task, so the two pointers name distinct contexts; the guard is dropped and
+    // interrupts are masked. Execution resumes here once a peer unblocks us.
+    unsafe { context_switch(prev_ptr, next_ptr) };
+    // Resumed as someone's successor: settle (and maybe reap) our predecessor.
+    post_switch();
+
+    // SAFETY: matching restore for the save above.
+    unsafe { cpu::irq_restore(saved) };
+}
+
+/// Block the current task until a peer unblocks it. Called from the `Send` path
+/// when the endpoint's ring is full; the receiver that drains a slot wakes us and
+/// deposits the message we were carrying.
+pub fn block_current() {
+    park_and_switch();
+}
+
+/// Block the current task until a message is delivered to it, then return that
+/// message. Called from the `Recv` path when nothing is buffered.
+///
+/// The `expect` is not a hopeful assertion: the only path that makes a task
+/// `Ready` out of a receive block is [`deliver`], which fills the mailbox *before*
+/// it changes the state. A woken receiver with an empty mailbox would mean some
+/// other code had unblocked a task standing in a receive queue, which is a kernel
+/// bug that must not be papered over by returning an empty message the program
+/// would then act on.
+#[must_use]
+pub fn block_for_message() -> KMessage {
+    park_and_switch();
+    let mut sched = SCHED.lock();
+    let me = sched.current;
+    sched.tasks[me]
+        .mailbox
+        .take()
+        .expect("a receiver was woken without a message")
+}
+
+/// Make a blocked task runnable again without switching to it. The caller keeps
+/// running; the woken task runs when the scheduler next picks it.
+///
+/// Waking a task that is not blocked is a no-op rather than an error: a task can
+/// die while standing in a wait queue, and [`forget_waiter`] races nothing here
+/// only because both run under the same lock.
+pub fn unblock(task: usize) {
+    let mut sched = SCHED.lock();
+    if sched.tasks[task].state == State::Blocked {
+        sched.tasks[task].state = State::Ready;
+        WAKEUPS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Deliver `km` into a blocked receiver's mailbox and make it runnable.
+///
+/// The mailbox is filled first and the state changed second, which is the
+/// ordering [`block_for_message`]'s `expect` depends on.
+pub fn deliver(task: usize, km: KMessage) {
+    let mut sched = SCHED.lock();
+    sched.tasks[task].mailbox = Some(km);
+    if sched.tasks[task].state == State::Blocked {
+        sched.tasks[task].state = State::Ready;
+        WAKEUPS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The slot index of the running task. Used by [`crate::ipc`] to name a waiter.
+///
+/// Panics outside a task, deliberately: an endpoint queue entry that named the
+/// bootstrap context would be a message addressed to something that cannot
+/// receive, and every caller reaches here from a syscall.
+#[must_use]
+pub fn current_id() -> usize {
+    let current = SCHED.lock().current;
+    assert!(current != NONE, "IPC outside a task");
+    current
+}
+
+/// Resolve `handle` against the **running** task's capability table.
+///
+/// Per-task by construction: there is no way to ask about anyone else's table,
+/// which is what makes a handle unforgeable rather than merely opaque.
+#[must_use]
+pub fn resolve_cap(handle: u32) -> Option<Cap> {
+    let sched = SCHED.lock();
+    if sched.current == NONE {
+        return None;
+    }
+    cap::resolve(&sched.tasks[sched.current].caps, handle)
+}
+
+/// Install `cap` into the running task's table at its lowest free handle,
+/// returning that handle — or `None` if the heap is exhausted.
+///
+/// This is how a capability that arrived over IPC becomes usable. Growing the
+/// table allocates, so this takes the heap's lock underneath the scheduler's.
+/// That direction is safe because the heap is a leaf — nothing under it reaches
+/// back into the scheduler — and it is the only nesting of the two that happens.
+pub fn install_cap_current(cap: Cap) -> Option<u32> {
+    let mut sched = SCHED.lock();
+    if sched.current == NONE {
+        return None;
+    }
+    let current = sched.current;
+    cap::install(&mut sched.tasks[current].caps, cap)
+}
+
+/// Tasks parked, tasks woken, and tasks that died while parked.
+#[must_use]
+pub fn block_counts() -> (u64, u64, u64) {
+    (
+        BLOCKS.load(Ordering::Relaxed),
+        WAKEUPS.load(Ordering::Relaxed),
+        DIED_BLOCKED.load(Ordering::Relaxed),
+    )
+}
+
 /// Terminate the current task and switch away for good. Never returns.
 ///
 /// The task cannot free its own stack — it is standing on it — so it marks itself
@@ -623,6 +896,17 @@ pub fn exit() -> ! {
     // so nothing restores the mask on its behalf; the successor's own resume path
     // does that for itself.
     let _ = unsafe { cpu::irq_save() };
+
+    // Leave every wait queue *before* the slot is marked dead. A task can die
+    // while parked — a ring-3 fault kills it wherever it stands — and an endpoint
+    // that still holds this slot index would hand the next message to a task
+    // whose stack has been reclaimed and whose address space no longer exists.
+    // Done here, in the one path out of a task, rather than in the fault handler:
+    // a task can also exit voluntarily while another task holds it on a queue it
+    // registered for and then abandoned.
+    if crate::ipc::forget_task(current_id()) > 0 {
+        DIED_BLOCKED.fetch_add(1, Ordering::Relaxed);
+    }
 
     let prev_ptr: *mut CpuContext;
     let next_ptr: *const CpuContext;
@@ -705,6 +989,14 @@ fn post_switch() {
         } else {
             None
         };
+        // A dead task's capability table is heap the task no longer needs, and
+        // dropping it is also what makes "granted" and "held" stop being the same
+        // number at the end of a run. The capabilities themselves are values, not
+        // authority — the authority is the object, and it outlives them.
+        if sched.tasks[prev].state == State::Dead {
+            sched.tasks[prev].caps = CapTable::new();
+            sched.tasks[prev].mailbox = None;
+        }
         (stack, space)
     };
     // `_freed` drops here, outside the scheduler lock.
