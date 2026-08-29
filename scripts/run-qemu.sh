@@ -20,6 +20,16 @@ DEBUG=0
 HEADLESS=0
 SHOT=""
 SHOT_DELAY="${SHOT_DELAY:-12}"
+# Wait for the guest to *say* it has drawn what the screenshot is meant to catch,
+# instead of counting seconds until it probably has.
+#
+# Twelve seconds was "generous for TCG" when it was written, and on a loaded host
+# it is not: the shot lands before the fault report is painted and the check
+# reports a blank screen — a true statement about the stopwatch and a false one
+# about the kernel. Given a log to watch and a pattern to find, the delay becomes
+# a fuse instead of a schedule.
+SHOT_WHEN=""
+SHOT_LOG=""
 MON=""
 
 
@@ -50,6 +60,8 @@ while [ $# -gt 0 ]; do
         --debug) DEBUG=1; shift ;;
         --headless) HEADLESS=1; shift ;;
         --screenshot) SHOT="${2:?--screenshot needs a path}"; HEADLESS=1; shift 2 ;;
+        --shot-when) SHOT_WHEN="${2:?--shot-when needs a pattern}"; shift 2 ;;
+        --shot-log) SHOT_LOG="${2:?--shot-log needs a path}"; shift 2 ;;
         --) shift; EXTRA=("$@"); break ;;
         -h|--help) usage; exit 0 ;;
         *) echo "run-qemu.sh: unknown argument '$1'" >&2; usage >&2; exit 2 ;;
@@ -125,7 +137,23 @@ if [ -n "$SHOT" ]; then
     # Detached, because QEMU never returns on its own: the kernel halts. The
     # delay has to outlast firmware plus boot, and 12s is generous for TCG.
     (
-        sleep "$SHOT_DELAY"
+        # Wait for the line that says the picture exists, if the caller named one,
+        # and fall back to the clock either way: a guest that never prints it has
+        # failed differently and the shot should still happen, so the check can say
+        # what was on screen instead of saying nothing.
+        if [ -n "$SHOT_WHEN" ] && [ -n "$SHOT_LOG" ]; then
+            for _ in $(seq "$((SHOT_DELAY * 10))"); do
+                if grep -aq "$SHOT_WHEN" "$SHOT_LOG" 2>/dev/null; then
+                    # The line is in the serial log; the frame it describes is
+                    # painted a moment later. A short settle beats a second poll.
+                    sleep 0.5
+                    break
+                fi
+                sleep 1
+            done
+        else
+            sleep "$SHOT_DELAY"
+        fi
         python3 - "$MON" "$(readlink -f "$SHOT")" <<'PYEOF'
 import socket, sys, time
 sock, out = sys.argv[1], sys.argv[2]

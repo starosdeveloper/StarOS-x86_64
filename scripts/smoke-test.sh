@@ -89,7 +89,13 @@ cp target/esp/staros/kernel "$GOOD"
 
 # --------------------------------------------------------------------------
 echo "==> [good] firmware -> loader -> kernel"
-boot "$LOG_DIR/good.log" --screenshot "$LOG_DIR/screen.ppm"
+# The screenshot is taken when the guest says the last thing that has to be on
+# screen — the double fault report — rather than after a fixed twelve seconds. The
+# fixed delay failed on a loaded host and reported "screen is (nearly) blank",
+# which is a fact about the stopwatch: every serial assertion in the same run
+# passed.
+boot "$LOG_DIR/good.log" --screenshot "$LOG_DIR/screen.ppm" \
+     --shot-when "halting - this core cannot continue" --shot-log "$LOG_DIR/good.log"
 L="$LOG_DIR/good.log"
 
 expect "$L" "loader announces itself"        'STAR OS loader v[0-9]'
@@ -222,10 +228,17 @@ expect "$L" "the timer runs periodically on its own vector" \
     'lapic timer: periodic, [0-9]+ ticks per interrupt on vector 49 \(100 Hz nominal\)'
 # The criterion, and it is a measurement rather than a presence check: a
 # calibration that read the wrong register or divided the wrong way still ticks
-# steadily forever, at the wrong rate, and only a second clock can tell. Observed
-# error over repeated boots is 0.0-0.1%; the tolerance is 2%.
+# steadily forever, at the wrong rate, and only a second clock can tell.
+#
+# This machine is one core, where the observed error is 0.0-0.1% and the second
+# after the decimal point is worth asserting on. The kernel's own bound is now
+# asymmetric — 2% fast, 25% slow — because on several cores under TCG the *host*
+# decides when a guest core runs, and lateness stops being a fact about the
+# kernel. Early does not: nothing an emulator does makes an interrupt arrive
+# before it was scheduled, so the fast side keeps the tight bound and this
+# assertion keeps the tight window.
 expect "$L" "a hundred ticks at 100 Hz took a second by the HPET" \
-    'timer: 100 interrupts at 100 Hz took (0\.9[89][0-9]|1\.0[01][0-9]) s by the HPET \([01]\.[0-9]% off, tolerance 2%\)'
+    'timer: 100 interrupts at 100 Hz took (0\.9[89][0-9]|1\.0[01][0-9]) s by the HPET \([01]\.[0-9]% off, tolerance 2% fast / 25% slow\)'
 
 # --- phase 2.4: two tasks, and a timer that takes the CPU away -------------
 # Neither task yields. Every switch between them is one the timer forced, which

@@ -79,6 +79,7 @@ pub mod port;
 pub mod selftest;
 pub mod serial;
 pub mod syscall;
+pub mod trampoline;
 pub mod trap;
 #[cfg(not(test))]
 pub mod usermode;

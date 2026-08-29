@@ -128,8 +128,15 @@ reached_the_end() {
     # turns out to be.
     expect "$log" "the HPET decoded"           'hpet: [0-9]+ Hz \([0-9]+ fs per tick\)'
     expect "$log" "the APIC timer was calibrated" 'lapic timer: [0-9]+ ticks/s at divisor 16'
+    #
+    # The window is asymmetric, for the reason the kernel's own bound is (see
+    # `selftest_timer`): a hundred ticks cannot arrive *early* unless the
+    # calibration made the timer fast, so the lower edge stays tight — but they
+    # can arrive late because the host was busy elsewhere, and on the four-core
+    # machine here they do: 1.039 s measured, against 1.000 on one core. Holding
+    # every machine to the one-core window asserts something about this laptop.
     expect "$log" "a second measured as a second" \
-        'timer: 100 interrupts at 100 Hz took (0\.9[89][0-9]|1\.0[01][0-9]) s by the HPET'
+        'timer: 100 interrupts at 100 Hz took (0\.9[89][0-9]|1\.[01][0-9][0-9]) s by the HPET'
     # And two tasks sharing that clock's ticks. The step counts are properties of
     # the machine's speed and are not asserted; what is asserted is that both
     # tasks finished, that the timer forced the switches, that each saw the other

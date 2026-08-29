@@ -240,7 +240,89 @@ impl<M: Mmio32> LocalApic<M> {
     pub fn timer_count(&mut self) -> u32 {
         self.regs.read(lapic_reg::TIMER_CURRENT_COUNT)
     }
+
+    /// Send the interrupt command in `low` to the APIC id in `dest`.
+    ///
+    /// The **high half goes first, always**. Writing `ICR_LOW` is what fires the
+    /// IPI, so a sequence that set the vector before the destination would send
+    /// each message to whoever the previous one was addressed to — correct on the
+    /// second try and wrong on the first, which is the shape of a bug that only
+    /// appears when a machine has more than two cores.
+    ///
+    /// Returns after the delivery-status bit clears, so the caller knows the
+    /// message left rather than that it was queued. `None` if it never cleared:
+    /// on a machine whose APIC is wedged, waiting for ever would turn a failed
+    /// core bring-up into a hung boot with no output.
+    pub fn send_ipi(&mut self, dest: u8, low: u32, expired: &mut dyn FnMut() -> bool) -> Option<()> {
+        self.wait_idle(expired)?;
+        self.regs.write(lapic_reg::ICR_HIGH, u32::from(dest) << 24);
+        self.regs.write(lapic_reg::ICR_LOW, low);
+        self.wait_idle(expired)
+    }
+
+    /// Spin until the last interrupt command has been accepted for delivery, or
+    /// until `expired` says the caller has waited long enough.
+    ///
+    /// The bound is **time the caller measures**, not a count of iterations here.
+    /// A count was the first version and it was wrong in both directions at once:
+    /// each turn of the loop is an MMIO read of an emulated APIC, so a million of
+    /// them is tens of seconds under TCG — long enough to be indistinguishable
+    /// from a hang — while on real hardware the same million would be over in
+    /// milliseconds and might give up on a chip that was merely slow. How long to
+    /// wait is a question about time; only the caller has a clock.
+    fn wait_idle(&mut self, expired: &mut dyn FnMut() -> bool) -> Option<()> {
+        loop {
+            if self.regs.read(lapic_reg::ICR_LOW) & ICR_DELIVERY_PENDING == 0 {
+                return Some(());
+            }
+            if expired() {
+                return None;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// Assert INIT at `dest`, which resets that core and leaves it waiting for a
+    /// startup message.
+    pub fn send_init(&mut self, dest: u8, expired: &mut dyn FnMut() -> bool) -> Option<()> {
+        self.send_ipi(dest, ICR_INIT | ICR_LEVEL_ASSERT, expired)
+    }
+
+    /// De-assert INIT. Required by the older APICs the level-triggered INIT
+    /// sequence was written for, and harmless on the ones that ignore it — which
+    /// is the whole argument for doing it: this sequence is copied from the
+    /// architecture manual rather than from what one machine tolerates.
+    pub fn send_init_deassert(
+        &mut self,
+        dest: u8,
+        expired: &mut dyn FnMut() -> bool,
+    ) -> Option<()> {
+        self.send_ipi(dest, ICR_INIT | ICR_LEVEL_TRIGGER, expired)
+    }
+
+    /// Tell `dest` to start executing at `page * 0x1000`, which must be below
+    /// 1 MiB — the startup message carries a page number in its low byte, and a
+    /// core answering it begins in 16-bit real mode.
+    pub fn send_startup(
+        &mut self,
+        dest: u8,
+        page: u8,
+        expired: &mut dyn FnMut() -> bool,
+    ) -> Option<()> {
+        self.send_ipi(dest, ICR_STARTUP | ICR_LEVEL_ASSERT | u32::from(page), expired)
+    }
 }
+
+/// Delivery status: set while the last command is still being sent.
+pub const ICR_DELIVERY_PENDING: u32 = 1 << 12;
+/// Delivery mode 101: INIT.
+pub const ICR_INIT: u32 = 0b101 << 8;
+/// Delivery mode 110: startup (SIPI).
+pub const ICR_STARTUP: u32 = 0b110 << 8;
+/// Level bit set — "assert". Ignored for anything but INIT, and required there.
+pub const ICR_LEVEL_ASSERT: u32 = 1 << 14;
+/// Trigger mode level, with the level bit clear: an INIT de-assert.
+pub const ICR_LEVEL_TRIGGER: u32 = 1 << 15;
 
 // --------------------------------------------------------------------------
 // I/O APIC
@@ -483,6 +565,58 @@ mod tests {
             self.writes.push((offset, value));
             self.state.insert(offset, value);
         }
+    }
+
+    #[test]
+    fn an_ipi_addresses_the_destination_before_it_fires() {
+        let mut lapic = LocalApic::new(Recorder::default());
+        lapic.send_ipi(3, ICR_STARTUP | 0x08, &mut || false).expect("delivery settles");
+
+        let writes = &lapic.regs.writes;
+        assert_eq!(writes.len(), 2, "one destination write and one command write");
+        // The order is the whole test. Writing ICR_LOW is what sends the message,
+        // so a driver that set the vector first would deliver it to whoever the
+        // *previous* command was addressed to — right on every attempt but the
+        // first, which is how this stays hidden until a third core exists.
+        assert_eq!(writes[0].0, lapic_reg::ICR_HIGH, "destination goes first");
+        assert_eq!(writes[0].1, 3 << 24, "APIC id sits in bits 24..31");
+        assert_eq!(writes[1].0, lapic_reg::ICR_LOW, "the command fires last");
+    }
+
+    #[test]
+    fn the_init_sequence_is_the_one_the_manual_describes() {
+        let mut lapic = LocalApic::new(Recorder::default());
+        lapic.send_init(1, &mut || false).expect("delivery settles");
+        lapic.send_init_deassert(1, &mut || false).expect("delivery settles");
+        lapic.send_startup(1, 0x08, &mut || false).expect("delivery settles");
+
+        let commands: Vec<u32> = lapic
+            .regs
+            .writes
+            .iter()
+            .filter(|(off, _)| *off == lapic_reg::ICR_LOW)
+            .map(|&(_, value)| value)
+            .collect();
+        assert_eq!(commands.len(), 3);
+        assert_eq!(commands[0], ICR_INIT | ICR_LEVEL_ASSERT, "INIT asserted");
+        assert_eq!(commands[1], ICR_INIT | ICR_LEVEL_TRIGGER, "INIT de-asserted");
+        assert_eq!(
+            commands[2],
+            ICR_STARTUP | ICR_LEVEL_ASSERT | 0x08,
+            "SIPI carries the page number, not an address",
+        );
+    }
+
+    #[test]
+    fn a_wedged_apic_is_reported_rather_than_waited_on_for_ever() {
+        let mut lapic = LocalApic::new(Recorder::default());
+        // Delivery status stuck: the model answers every read with the pending
+        // bit set, which is what a wedged APIC looks like from here.
+        lapic.regs.state.insert(lapic_reg::ICR_LOW, ICR_DELIVERY_PENDING);
+        assert!(
+            lapic.send_ipi(1, ICR_STARTUP, &mut || true).is_none(),
+            "a core that will not accept a message must not hang the boot",
+        );
     }
 
     /// A model of an I/O APIC's indirect register file: a select register and a

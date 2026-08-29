@@ -82,6 +82,55 @@ static DEVICE_NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 /// # Safety
 /// `phys` must be device registers nothing else has mapped, and `tables` must be
 /// the live tree. Called on the boot core during bring-up.
+/// Map `phys` at the *same* virtual address, with the rights given.
+///
+/// Exactly one caller, and it is the reason this exists: a core coming out of a
+/// startup message enables paging while executing from a physical address below
+/// 1 MiB, and between `mov cr0` and the far jump that follows it, that address
+/// has to mean the same thing with paging on as it did with paging off. Nothing
+/// else in this kernel wants an identity mapping, and the absence of one is what
+/// makes a stray physical address fault instead of working by accident.
+///
+/// The mapping is removed by [`unmap_identity`] once every core has answered.
+///
+/// # Safety
+/// Called on the boot processor with `tables` live. The range must be memory the
+/// kernel controls — this hands out kernel rights to a fixed address.
+pub unsafe fn map_identity(
+    tables: &Tables,
+    phys: u64,
+    len: u64,
+    rights: Rights,
+) -> Result<(), &'static str> {
+    let span = len.next_multiple_of(PAGE_SIZE);
+    let mut frames = KernelFrames;
+    let mut mapper = Mapper::adopt(tables.root, &mut frames, tables.gib_pages);
+    mapper.map(phys, phys, span, rights).map_err(MapError::as_str)?;
+    for page in (0..span).step_by(PAGE_SIZE as usize) {
+        // SAFETY: ring 0; the address was just given a mapping, and the CPU
+        // caches the absence of one as readily as its presence.
+        unsafe { staros_arch_x86_64::cpu::invlpg(phys + page) };
+    }
+    Ok(())
+}
+
+/// Take an identity mapping back out.
+///
+/// # Safety
+/// Nothing may still be executing or reading through it — for the trampoline that
+/// means every core has acknowledged.
+pub unsafe fn unmap_identity(tables: &Tables, phys: u64, len: u64) {
+    let span = len.next_multiple_of(PAGE_SIZE);
+    let mut frames = KernelFrames;
+    let mut mapper = Mapper::adopt(tables.root, &mut frames, tables.gib_pages);
+    for page in (0..span).step_by(PAGE_SIZE as usize) {
+        mapper.unmap(phys + page);
+        // SAFETY: ring 0; the translation was just removed and the TLB still
+        // holds it.
+        unsafe { staros_arch_x86_64::cpu::invlpg(phys + page) };
+    }
+}
+
 pub unsafe fn map_device(tables: &Tables, phys: u64, len: u64) -> Result<u64, &'static str> {
     use core::sync::atomic::Ordering;
 

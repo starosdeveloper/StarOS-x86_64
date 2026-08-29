@@ -36,6 +36,13 @@ const HEADER_BYTES: usize = 36;
 /// them and far short of anything dangerous.
 const MAX_TABLE_BYTES: usize = 64 * 1024;
 
+/// How many CPU ids [`Facts`] carries.
+///
+/// Sixty-four, matching what the MADT parser was already given. A machine with
+/// more cores boots on the ones that fit and the count says so, which is better
+/// than a table quietly describing a different machine than the one running.
+pub const MAX_CPU_IDS: usize = 64;
+
 /// What the kernel took out of ACPI.
 #[derive(Clone, Copy, Debug)]
 pub struct Facts {
@@ -47,6 +54,14 @@ pub struct Facts {
     pub has_legacy_pics: bool,
     /// How many CPUs the firmware says are startable.
     pub cpus: usize,
+    /// The APIC id of each of them, in table order.
+    ///
+    /// Kept rather than recomputed, because bring-up needs the *identities* and
+    /// not the count: a startup message is addressed to an id, and the ids on a
+    /// real machine are not 0..n — firmware may leave gaps, and an
+    /// implementation that assumed otherwise would send its messages to cores
+    /// that are not there while the ones that are wait for ever.
+    pub cpu_ids: [u32; MAX_CPU_IDS],
     /// Physical address of the first HPET block, if the machine has one.
     ///
     /// Optional in a way the APICs are not: a machine without an HPET is
@@ -143,7 +158,7 @@ pub unsafe fn discover(console: &mut Console, rsdp_phys: u64) -> Option<Facts> {
     let madt_bytes = unsafe { find_table(rsdp_phys, b"APIC") }?;
     let madt = Madt::parse(madt_bytes)?;
 
-    let mut ids = [0u32; 64];
+    let mut ids = [0u32; MAX_CPU_IDS];
     let cpus = madt.cpus(&mut ids);
 
     // Absent on a machine with no HPET, which is legal and only costs the APIC
@@ -160,6 +175,7 @@ pub unsafe fn discover(console: &mut Console, rsdp_phys: u64) -> Option<Facts> {
             .map(|(address, gsi_base)| (u64::from(address), gsi_base)),
         has_legacy_pics: madt.has_legacy_pics,
         cpus,
+        cpu_ids: ids,
         hpet,
         madt: (madt_bytes.as_ptr() as u64).wrapping_sub(staros_bootinfo::PHYS_MAP_BASE),
     };

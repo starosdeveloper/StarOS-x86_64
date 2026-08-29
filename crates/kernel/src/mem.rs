@@ -339,6 +339,20 @@ pub fn alloc_frame() -> Option<PhysAddr> {
     frame
 }
 
+/// Allocate `count` physically contiguous frames, or `None`.
+///
+/// Contiguity is asked for where it is genuinely needed rather than as a habit: a
+/// woken core's stack is the caller here, and a stack split across a hole faults
+/// the first time it grows past the first frame — on a core that does not yet
+/// have an interrupt table to report the fault with.
+pub fn alloc_frames(count: usize) -> Option<PhysAddr> {
+    let frames = with(|a| a.alloc_pages(count));
+    if frames.is_some() {
+        IN_USE.fetch_add(count as u64, core::sync::atomic::Ordering::Relaxed);
+    }
+    frames
+}
+
 /// Return a frame to the pool.
 pub fn free_frame(frame: PhysAddr) {
     with(|a| a.free_pages(frame));

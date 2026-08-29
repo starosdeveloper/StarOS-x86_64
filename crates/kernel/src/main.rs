@@ -42,6 +42,7 @@ mod irq;
 mod mem;
 mod obj;
 mod sched;
+mod smp;
 mod sync;
 mod traps;
 mod usermode;
@@ -337,6 +338,20 @@ unsafe extern "C" fn kmain(boot_info: *const BootInfo) -> ! {
                         Ok(rate) => {
                             // SAFETY: the timer is calibrated and stopped.
                             ok &= unsafe { irq::selftest_timer(console, rate) };
+
+                            // Phase 4: the rest of the machine. Everything up to
+                            // here ran on the core the firmware happened to
+                            // start, while the others sat in a halt state since
+                            // power-on. Waking them needs the clock — the
+                            // INIT/SIPI sequence names its delays in
+                            // milliseconds — so it comes after the timer and
+                            // before anything that would like to run on them.
+                            //
+                            // SAFETY: the APICs are up, the timer is calibrated,
+                            // interrupts are masked and the tables are live.
+                            unsafe {
+                                smp::start_cores(console, &tables, &facts, facts.local_apic);
+                            }
 
                             // And something for the ticks to do. Until now every
                             // tick was counted and discarded; from here one of
