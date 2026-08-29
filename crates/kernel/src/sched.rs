@@ -263,18 +263,25 @@ struct Scheduler {
     /// These are not.
     #[allow(clippy::vec_box)]
     tasks: Vec<Box<Task>>,
-    /// The context `start` was called from, returned to when nothing is runnable.
-    bootstrap: CpuContext,
-    /// The slot this core is running, or [`NONE`] in the bootstrap context.
-    current: usize,
+    /// The context `start` was called from on each core, returned to when nothing
+    /// is runnable there.
+    ///
+    /// One per core, not one for the machine. A second core entering the scheduler
+    /// would otherwise overwrite the first core's saved context, and the first
+    /// core would return from its next idle into the second core's stack — the
+    /// kind of failure that only happens once the machine is doing real work.
+    bootstrap: [CpuContext; MAX_CPUS],
+    /// The slot each core is running, or [`NONE`] where that core is in its
+    /// bootstrap context.
+    current: [usize; MAX_CPUS],
 }
 
 impl Scheduler {
     const fn new() -> Self {
         Self {
             tasks: Vec::new(),
-            bootstrap: CpuContext::empty(),
-            current: NONE,
+            bootstrap: [const { CpuContext::empty() }; MAX_CPUS],
+            current: [NONE; MAX_CPUS],
         }
     }
 
@@ -298,8 +305,23 @@ impl Scheduler {
 
 static SCHED: SpinLock<Scheduler> = SpinLock::new(Scheduler::new());
 
-/// Set by the timer tick to request a reschedule at the next IRQ epilogue.
-static NEED_RESCHED: AtomicBool = AtomicBool::new(false);
+/// Set by the timer tick to request a reschedule at the next IRQ epilogue, per
+/// core.
+///
+/// One flag for the machine would mean a tick on any core rescheduling *some*
+/// core — whichever reached its epilogue first — while the one that actually took
+/// the interrupt kept running. The counters would still look right, which is what
+/// makes it worth spelling out.
+static NEED_RESCHED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// How many cores the scheduler tracks. The arch crate's `PerCpu` table is the
+/// same size, and the index used here is the one it hands out.
+const MAX_CPUS: usize = staros_arch_x86_64::syscall::MAX_CPUS;
+
+/// Which core is executing, as an index.
+fn me() -> usize {
+    core::cmp::min(staros_arch_x86_64::syscall::cpu_index() as usize, MAX_CPUS - 1)
+}
 
 /// The slot this core last switched *away from*, handed to whichever context it
 /// resumes next so that context can — if the task exited — free its kernel stack.
@@ -307,8 +329,9 @@ static NEED_RESCHED: AtomicBool = AtomicBool::new(false);
 /// nothing to settle.
 ///
 /// Written by every switch-out and read and cleared solely by whatever this core
-/// resumes into, so it is never shared.
-static PREV: AtomicUsize = AtomicUsize::new(NONE);
+/// resumes into — so it is per core, and sharing one across cores would hand a
+/// task's kernel stack to a context on another core that never ran it.
+static PREV: [AtomicUsize; MAX_CPUS] = [const { AtomicUsize::new(NONE) }; MAX_CPUS];
 
 /// Context switches performed.
 static SWITCHES: AtomicU64 = AtomicU64::new(0);
@@ -375,11 +398,12 @@ pub fn reaped_spaces() -> (u64, u64) {
 /// The address space of the running task, if it has one.
 #[must_use]
 pub fn current_space() -> Option<AddressSpace> {
+    let cpu = me();
     let sched = SCHED.lock();
-    if sched.current == NONE {
+    if sched.current[cpu] == NONE {
         return None;
     }
-    sched.tasks[sched.current].space
+    sched.tasks[sched.current[cpu]].space
 }
 
 /// Dead-task kernel stacks reaped so far, and the bytes that freed.
@@ -564,6 +588,7 @@ pub fn start() {
     // resumed by a preemption returns through `iretq`, which restores `IF` from
     // the frame it was interrupted with.
     let saved = unsafe { cpu::irq_save() };
+    let cpu = me();
     // The tree the kernel is in right now. Recorded here because this is the one
     // place guaranteed to run before any task has switched `CR3` away from it,
     // and the bootstrap context has to be able to get back.
@@ -573,14 +598,14 @@ pub fn start() {
         let picked = {
             let mut sched = SCHED.lock();
             sched.first_ready().map(|first| {
-                sched.current = first;
+                sched.current[cpu] = first;
                 sched.tasks[first].state = State::Running;
                 // Switching *from* the bootstrap context, which is not a task —
                 // nothing for the successor to settle.
-                PREV.store(NONE, Ordering::Relaxed);
+                PREV[cpu].store(NONE, Ordering::Relaxed);
                 let top = sched.tasks[first].kernel_stack_top;
                 let cr3 = sched.tasks[first].cr3;
-                let boot: *mut CpuContext = &mut sched.bootstrap;
+                let boot: *mut CpuContext = &mut sched.bootstrap[cpu];
                 let next: *const CpuContext = &sched.tasks[first].ctx;
                 (boot, next, top, cr3)
             })
@@ -632,17 +657,19 @@ pub fn yield_now() {
 /// "kill the task" is only an answer when there is one.
 #[must_use]
 pub fn in_task() -> bool {
-    SCHED.lock().current != NONE
+    let cpu = me();
+    SCHED.lock().current[cpu] != NONE
 }
 
 /// The name of the running task, or `"bootstrap"` outside one. For fault reports.
 #[must_use]
 pub fn current_name() -> &'static str {
+    let cpu = me();
     let sched = SCHED.lock();
-    if sched.current == NONE {
+    if sched.current[cpu] == NONE {
         return "bootstrap";
     }
-    sched.tasks[sched.current].name
+    sched.tasks[sched.current[cpu]].name
 }
 
 /// Ask for a reschedule at the next IRQ epilogue. Called from the timer tick.
@@ -651,7 +678,7 @@ pub fn current_name() -> &'static str {
 /// built and the interrupt not yet acknowledged. Switching there would strand the
 /// acknowledgement in a task that is no longer on the CPU.
 pub fn request_resched() {
-    NEED_RESCHED.store(true, Ordering::Relaxed);
+    NEED_RESCHED[me()].store(true, Ordering::Relaxed);
 }
 
 /// Run at the end of interrupt handling, after the controller has been
@@ -663,7 +690,7 @@ pub fn request_resched() {
 /// task is picked again the switch returns into this function, the handler
 /// unwinds, and `iretq` puts the task back exactly where the interrupt found it.
 pub fn on_irq_epilogue() {
-    if NEED_RESCHED.swap(false, Ordering::Relaxed) && reschedule() {
+    if NEED_RESCHED[me()].swap(false, Ordering::Relaxed) && reschedule() {
         PREEMPTIONS.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -677,9 +704,10 @@ fn reschedule() -> bool {
     let next_ptr: *const CpuContext;
     let next_top: u64;
     let next_cr3: u64;
+    let cpu = me();
     {
         let mut sched = SCHED.lock();
-        let prev = sched.current;
+        let prev = sched.current[cpu];
         // Not in a task: this core is in its bootstrap context, so there is
         // nothing to switch away from. Happens on every tick that lands during
         // boot, before `start`.
@@ -693,10 +721,10 @@ fn reschedule() -> bool {
             sched.tasks[prev].state = State::Ready;
         }
         sched.tasks[next].state = State::Running;
-        sched.current = next;
+        sched.current[cpu] = next;
         // Hand `prev` to our successor. Today it only matters for a dead task's
         // stack; `prev` is alive here, so the successor will find nothing to do.
-        PREV.store(prev, Ordering::Relaxed);
+        PREV[cpu].store(prev, Ordering::Relaxed);
         next_top = sched.tasks[next].kernel_stack_top;
         next_cr3 = sched.tasks[next].cr3;
         prev_ptr = &mut sched.tasks[prev].ctx;
@@ -741,30 +769,31 @@ fn park_and_switch() {
     let next_ptr: *const CpuContext;
     let next_top: Option<u64>;
     let next_cr3: u64;
+    let cpu = me();
     {
         let mut sched = SCHED.lock();
-        let prev = sched.current;
+        let prev = sched.current[cpu];
         // Blocking from the bootstrap context would be blocking the thing that
         // resumes blocked tasks. Nothing does it: every caller arrives from a
         // syscall, which by definition ran in a task.
         assert!(prev != NONE, "blocked outside a task");
         sched.tasks[prev].state = State::Blocked;
         BLOCKS.fetch_add(1, Ordering::Relaxed);
-        PREV.store(prev, Ordering::Relaxed);
+        PREV[cpu].store(prev, Ordering::Relaxed);
         prev_ptr = &mut sched.tasks[prev].ctx;
         match sched.pick_next(prev) {
             Some(next) => {
                 sched.tasks[next].state = State::Running;
-                sched.current = next;
+                sched.current[cpu] = next;
                 next_top = Some(sched.tasks[next].kernel_stack_top);
                 next_cr3 = sched.tasks[next].cr3;
                 next_ptr = &sched.tasks[next].ctx;
             }
             None => {
-                sched.current = NONE;
+                sched.current[cpu] = NONE;
                 next_top = None;
                 next_cr3 = KERNEL_ROOT.load(Ordering::SeqCst);
-                next_ptr = &sched.bootstrap;
+                next_ptr = &sched.bootstrap[cpu];
             }
         }
     }
@@ -800,9 +829,10 @@ pub fn block_current() {
 #[must_use]
 pub fn block_for_message() -> KMessage {
     park_and_switch();
+    let cpu = me();
     let mut sched = SCHED.lock();
-    let me = sched.current;
-    sched.tasks[me]
+    let running = sched.current[cpu];
+    sched.tasks[running]
         .mailbox
         .take()
         .expect("a receiver was woken without a message")
@@ -842,7 +872,8 @@ pub fn deliver(task: usize, km: KMessage) {
 /// receive, and every caller reaches here from a syscall.
 #[must_use]
 pub fn current_id() -> usize {
-    let current = SCHED.lock().current;
+    let cpu = me();
+    let current = SCHED.lock().current[cpu];
     assert!(current != NONE, "IPC outside a task");
     current
 }
@@ -853,11 +884,12 @@ pub fn current_id() -> usize {
 /// which is what makes a handle unforgeable rather than merely opaque.
 #[must_use]
 pub fn resolve_cap(handle: u32) -> Option<Cap> {
+    let cpu = me();
     let sched = SCHED.lock();
-    if sched.current == NONE {
+    if sched.current[cpu] == NONE {
         return None;
     }
-    cap::resolve(&sched.tasks[sched.current].caps, handle)
+    cap::resolve(&sched.tasks[sched.current[cpu]].caps, handle)
 }
 
 /// Install `cap` into the running task's table at its lowest free handle,
@@ -868,11 +900,12 @@ pub fn resolve_cap(handle: u32) -> Option<Cap> {
 /// That direction is safe because the heap is a leaf — nothing under it reaches
 /// back into the scheduler — and it is the only nesting of the two that happens.
 pub fn install_cap_current(cap: Cap) -> Option<u32> {
+    let cpu = me();
     let mut sched = SCHED.lock();
-    if sched.current == NONE {
+    if sched.current[cpu] == NONE {
         return None;
     }
-    let current = sched.current;
+    let current = sched.current[cpu];
     cap::install(&mut sched.tasks[current].caps, cap)
 }
 
@@ -912,16 +945,17 @@ pub fn exit() -> ! {
     let next_ptr: *const CpuContext;
     let next_top: Option<u64>;
     let next_cr3: u64;
+    let cpu = me();
     {
         let mut sched = SCHED.lock();
-        let prev = sched.current;
+        let prev = sched.current[cpu];
         sched.tasks[prev].state = State::Dead;
-        PREV.store(prev, Ordering::Relaxed);
+        PREV[cpu].store(prev, Ordering::Relaxed);
         prev_ptr = &mut sched.tasks[prev].ctx;
         match sched.pick_next(prev) {
             Some(next) => {
                 sched.tasks[next].state = State::Running;
-                sched.current = next;
+                sched.current[cpu] = next;
                 next_top = Some(sched.tasks[next].kernel_stack_top);
                 next_cr3 = sched.tasks[next].cr3;
                 next_ptr = &sched.tasks[next].ctx;
@@ -932,13 +966,13 @@ pub fn exit() -> ! {
             // leaving the dead task's would be worse than leaving the last live
             // one's, since its stack is about to be freed.
             None => {
-                sched.current = NONE;
+                sched.current[cpu] = NONE;
                 next_top = None;
                 // Back to the kernel's own tree. This task's is about to be torn
                 // down, and the bootstrap context must not be the thing standing
                 // in it when that happens.
                 next_cr3 = KERNEL_ROOT.load(Ordering::SeqCst);
-                next_ptr = &sched.bootstrap;
+                next_ptr = &sched.bootstrap[cpu];
             }
         }
     }
@@ -961,7 +995,7 @@ pub fn exit() -> ! {
 /// The freed `Box` is dropped *after* the scheduler lock is released, so the
 /// heap's lock never nests underneath the scheduler's.
 fn post_switch() {
-    let prev = PREV.swap(NONE, Ordering::Relaxed);
+    let prev = PREV[me()].swap(NONE, Ordering::Relaxed);
     if prev == NONE {
         return;
     }

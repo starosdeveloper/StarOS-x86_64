@@ -31,7 +31,15 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-TIMEOUT="${TIMEOUT:-45}"
+# Generous, because it is a fuse rather than a schedule.
+#
+# It was 45 seconds, which is plenty for one boot on an idle machine and not
+# enough for the seventh in a row on a busy one. The failure looks nothing like a
+# slow host: the log holds the firmware's output and not one line from the kernel,
+# so the honest reading is "the kernel never started" — and on the release
+# profile, where the compiler output really is different, that reading is even
+# plausible. It was wrong. The same image booted by hand ran every self-test.
+TIMEOUT="${TIMEOUT:-120}"
 
 # A fixed directory, emptied at the start and *kept* afterwards. A matrix that
 # deletes its logs on the way out can tell you that twelve assertions failed and

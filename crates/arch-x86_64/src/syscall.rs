@@ -169,6 +169,14 @@ pub struct PerCpu {
     /// Where the stub parks the user's `RSP` for the two instructions between
     /// "we are in the kernel" and "we are on a kernel stack".
     pub scratch_rsp: u64,
+    /// This core's index into [`PERCPU`], and the number the kernel calls it by.
+    ///
+    /// Kept *here* rather than derived from the APIC id at each use. The APIC id
+    /// is what hardware calls a core and is not an index — firmware leaves gaps —
+    /// so anything that wanted an index would have to search a table it does not
+    /// have, at a moment (the syscall path, a trap) where there is nothing to
+    /// search with. `GS` already points here, so this is one load.
+    pub cpu_index: u64,
 }
 
 /// Byte offsets into [`PerCpu`], shared with the assembly below as `const`
@@ -176,14 +184,25 @@ pub struct PerCpu {
 const OFF_KERNEL_RSP: usize = 0;
 const OFF_SCRATCH_RSP: usize = 8;
 
-/// The one core's [`PerCpu`], pointed at by [`IA32_KERNEL_GS_BASE`].
+/// How many cores this kernel can run on.
 ///
-/// A single static rather than an array: this kernel runs one core until phase 4,
-/// and an array indexed by a core id nothing can compute yet would be a promise
-/// rather than a mechanism.
-static mut PERCPU: PerCpu = PerCpu { kernel_rsp: 0, scratch_rsp: 0 };
+/// A fixed array rather than a heap allocation, because the syscall stub reaches
+/// its own entry through `GS` with no chance to check anything: whatever this
+/// points at has to exist before the first core is woken and never move.
+pub const MAX_CPUS: usize = 32;
 
-/// Tell the syscall path which kernel stack to switch to.
+/// One [`PerCpu`] per core, each pointed at by that core's
+/// [`IA32_KERNEL_GS_BASE`].
+///
+/// It was a single static while the kernel ran one core, on the argument that an
+/// array indexed by a core id nothing could compute would be a promise rather
+/// than a mechanism. Phase 4 is where the id becomes computable, so the array is
+/// the mechanism now — and the index lives in the block itself, so a core can
+/// answer "which am I" from the same pointer it already has.
+static mut PERCPU: [PerCpu; MAX_CPUS] =
+    [const { PerCpu { kernel_rsp: 0, scratch_rsp: 0, cpu_index: 0 } }; MAX_CPUS];
+
+/// Tell the syscall path which kernel stack to switch to, for **this** core.
 ///
 /// Called by the scheduler on every switch, because the answer is per-task: the
 /// stack a syscall from ring 3 must land on is the kernel stack of the task that
@@ -191,20 +210,41 @@ static mut PERCPU: PerCpu = PerCpu { kernel_rsp: 0, scratch_rsp: 0 };
 ///
 /// `rsp` is the **top** — the first address the stub will push below.
 pub fn set_kernel_stack(rsp: u64) {
+    let index = cpu_index() as usize;
     let percpu = &raw mut PERCPU;
-    // SAFETY: `PERCPU` is private to this module. The only other writer is the
-    // stub's scratch slot, which this does not touch, and the stub cannot run
-    // concurrently on one core.
-    unsafe { (*percpu).kernel_rsp = rsp };
+    // SAFETY: `PERCPU` is private to this module and `index` is this core's own
+    // slot, which no other core writes. The stub's scratch word is untouched, and
+    // the stub cannot run concurrently on this core.
+    unsafe { (*percpu)[index].kernel_rsp = rsp };
 }
 
-/// The kernel stack the syscall path would switch to, read back from the block
-/// the hardware will actually use.
+/// The kernel stack the syscall path would switch to on this core, read back from
+/// the block the hardware will actually use.
 #[must_use]
 pub fn kernel_stack() -> u64 {
+    let index = cpu_index() as usize;
     let percpu = &raw const PERCPU;
-    // SAFETY: as `set_kernel_stack`; a plain read of a private static.
-    unsafe { (*percpu).kernel_rsp }
+    // SAFETY: as `set_kernel_stack`; a plain read of this core's own slot.
+    unsafe { (*percpu)[index].kernel_rsp }
+}
+
+/// Which core this is, as an index into [`PERCPU`].
+///
+/// Read through `IA32_KERNEL_GS_BASE` rather than through `GS` itself, because
+/// ordinary ring-0 code runs with `GS_BASE` zero — the block is in the *other*
+/// base until `swapgs` brings it in, and this must answer correctly from both
+/// sides of that swap.
+#[must_use]
+pub fn cpu_index() -> u64 {
+    // SAFETY: ring 0. The MSR holds the address of this core's `PerCpu`, written
+    // by `init` before any code that calls this can run.
+    let block = unsafe { crate::cpu::read_msr(IA32_KERNEL_GS_BASE) } as *const PerCpu;
+    if block.is_null() {
+        return 0;
+    }
+    // SAFETY: the pointer is one this module installed, into a static that
+    // outlives every core.
+    unsafe { (*block).cpu_index }
 }
 
 /// The caller's state as the entry stub saves it, in push order.
@@ -338,12 +378,19 @@ unsafe extern "C" fn staros_syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
 /// written into `IA32_STAR` name descriptors that must already exist — and before
 /// anything enters ring 3.
 #[cfg(not(test))]
-pub unsafe fn init() {
+pub unsafe fn init(cpu: usize) {
     use crate::cpu;
     use crate::gdt;
 
     let star = star_value(gdt::KERNEL_CODE, gdt::USER_CODE32 & !3);
+    let index = core::cmp::min(cpu, MAX_CPUS - 1);
     let percpu = &raw mut PERCPU;
+    // SAFETY: this core's own slot, written before the block is published to the
+    // MSR below, so nothing can read it half-initialised.
+    unsafe { (*percpu)[index].cpu_index = index as u64 };
+    // SAFETY: `PERCPU` is a static this module owns; taking the address of one
+    // element does not read it, and `index` was clamped above.
+    let percpu = unsafe { core::ptr::addr_of_mut!((*percpu)[index]) };
 
     // SAFETY: ring 0. Each write either enables an instruction that is currently
     // `#UD` or configures where it lands, and all four are in place before the

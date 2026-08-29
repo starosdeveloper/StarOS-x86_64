@@ -182,9 +182,13 @@ pub unsafe fn init(console: &mut Console, tables: &Tables) -> Result<(), &'stati
     // preemptions instead of fifteen.
     publish_ticks(crate::irq::ticks());
 
+    // Core 0, because this runs on the boot processor. A woken core does the same
+    // for itself with its own index; the per-core block is what `GS` points at,
+    // and two cores sharing one would mean two tasks landing on one kernel stack.
+    //
     // SAFETY: the GDT is installed and holds the selectors `IA32_STAR` names; the
     // handler is registered before anything can call it; nothing is in ring 3.
-    unsafe { arch_syscall::init() };
+    unsafe { arch_syscall::init(0) };
     arch_syscall::set_handler(on_syscall);
     // SAFETY: ring 0.
     if !unsafe { arch_syscall::is_enabled() } {
